@@ -7,17 +7,24 @@ from unittest.mock import patch
 from vllm import LLM, SamplingParams
 import random
 import json
-from cs336_alignment.utils import tokenize_prompt_and_output, get_response_log_probs, masked_normalize, compute_entropy, sft_microbatch_train_step
+from cs336_alignment.sft_utils import tokenize_prompt_and_output, get_response_log_probs, masked_normalize, compute_entropy, sft_microbatch_train_step
 from drgrpo_grader import r1_zero_reward_fn
 from typing import Callable, List, Tuple
 import re
 from baseline import run_vllm
 
-QWEN_MATH_BASE_PATH = "/home/ubuntu/model/Qwen2.5-Math-1.5B"
-PROMPT_PATH = "/home/ubuntu/repos/assignment-5/cs336_alignment/prompts/r1_zero.prompt"
-TEST_DATA_PATH = "/home/ubuntu/repos/assignment-5/data/gsm8k/test.jsonl"
-OUTPUT_PATH = "/home/ubuntu/repos/assignment-5/data/sft2_correct"
-MATH_DATA_PATH = "/home/aiscuser/repos/assignment-5/cs336_alignment/baseline_result.jsonl"
+import os
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+QWEN_MATH_BASE_MODEL_PATH = os.path.join(PROJECT_ROOT, "models/Qwen2.5-Math-1.5B-Base")
+PROMPT_PATH = os.path.join(CURRENT_DIR, "prompts/r1_zero.prompt")
+MATH_DATA_PATH = os.path.join(PROJECT_ROOT, "data/gsm8k")
+
+TEST_DATA_PATH = os.path.join(PROJECT_ROOT, "data/gsm8k/test.jsonl")
+OUTPUT_PATH = os.path.join(PROJECT_ROOT, "data/sft2_correct")
+MATH_DATA_PATH = os.path.join(PROJECT_ROOT, "cs336_alignment/baseline_result.jsonl")
+
 SEED = 69
 torch.manual_seed(SEED)
 random.seed(SEED)

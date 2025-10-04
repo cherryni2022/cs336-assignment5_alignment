@@ -1,0 +1,79 @@
+_wandb:
+    value:
+        cli_version: 0.19.11
+        m:
+            - "1": train_step
+              "6":
+                - 3
+              "7": []
+            - "1": eval_step
+              "6":
+                - 3
+              "7": []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 30
+                - 41
+                - 49
+                - 53
+                - 55
+                - 71
+                - 95
+            "2":
+                - 1
+                - 5
+                - 11
+                - 30
+                - 41
+                - 49
+                - 53
+                - 55
+                - 71
+                - 95
+            "3":
+                - 7
+                - 13
+                - 16
+                - 23
+                - 55
+            "4": 3.12.3
+            "5": 0.19.11
+            "6": 4.51.3
+            "8":
+                - 5
+            "10":
+                - 20
+            "12": 0.19.11
+            "13": linux-x86_64
+eval:
+    value:
+        data_path: /root/autodl-tmp/nw_assignment5-alignment/data/gsm8k/test.jsonl
+        max_tokens: 1024
+        prompt_path: /root/autodl-tmp/nw_assignment5-alignment/cs336_alignment/prompts/r1_zero.prompt
+        temperature: 1
+        top_p: 1
+train:
+    value:
+        betas:
+            - 0.9
+            - 0.98
+        eval_device: cuda:1
+        eval_interval_steps: 32
+        experiment_name: sft-qwen2.5-math
+        experiment_name_base: experiments
+        gradient_accumulation_steps: 8
+        learning_rate: 5e-06
+        local_model_path: /root/autodl-tmp/nw_assignment5-alignment/models/Qwen2.5-Math-1.5B-Base
+        micro_batch_size: 8
+        mixed_precision_training: true
+        model_name: Qwen/Qwen2.5-Math-1.5B
+        n_sft_steps: 256
+        num_train_samples: 128
+        prompt_path: /root/autodl-tmp/nw_assignment5-alignment/cs336_alignment/prompts/r1_zero.prompt
+        sft_train_batch_size: 64
+        train_data_path: /root/autodl-tmp/nw_assignment5-alignment/data/gsm8k/train.jsonl
+        train_device: cuda:0

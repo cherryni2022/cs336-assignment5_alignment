@@ -1,102 +1,59 @@
+import gc
+import json
+import time
+from pathlib import Path
+
+import regex as re
 import torch
-from transformers import PreTrainedTokenizerBase
+from rich import print
 
-def tokenize_prompt_and_output(prompt_strs: list[str], output_strs: list[str], tokenizer: PreTrainedTokenizerBase) -> dict[str, torch.Tensor]:
-    prompt_input_ids = []
-    output_input_ids = []
 
-    for prompt in prompt_strs:
-        tokens = tokenizer.encode(prompt, add_special_tokens=False)
-        prompt_input_ids.append(torch.tensor(tokens))
-    for output in output_strs:
-        tokens = tokenizer.encode(output, add_special_tokens=False)
-        output_input_ids.append(torch.tensor(tokens))
-    
-    seq_lengths = [len(p_ids) + len(o_ids) for p_ids, o_ids in zip(prompt_input_ids, output_input_ids)]
-    max_length = max(seq_lengths)
+def clear():
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
-    concatenated_input_ids = []
-    concatenated_labels = []
-    response_masks = []
 
-    for p_ids, o_ids, in zip(prompt_input_ids, output_input_ids):
-        # 用于训练, prompt + output 拼接到一起, LLM根据整体prompt训练
-        input_ids = torch.cat([p_ids, o_ids], dim=0)
-        response_mask = torch.cat([
-            torch.zeros_like(p_ids, dtype=torch.bool),
-            torch.ones_like(o_ids, dtype=torch.bool)
-        ], dim=0)
-        pad_length = max_length - input_ids.shape[0]
-        padded_input_ids = torch.nn.functional.pad(input_ids, (0, pad_length), value=tokenizer.pad_token_id)
-        padded_response_mask = torch.nn.functional.pad(response_mask, (0, pad_length), value=False)
+def safe_slug(s: str) -> str:
+    # Replace path separators and any weird chars with '-'
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", s.replace("/", "-").replace("\\", "-"))
 
-        concatenated_input_ids.append(padded_input_ids[:-1])
-        concatenated_labels.append(padded_input_ids[1:])
-        response_masks.append(padded_response_mask[1:])    ### set prompt and padding to be false, will not calculate loss
 
-    input_ids_tensor = torch.stack(concatenated_input_ids)
-    label_tensor = torch.stack(concatenated_labels)
-    response_mask_tensor = torch.stack(response_masks)
+def get_run_name(prefix: str, config):
+    date = time.strftime("%m%d-%H%M%S")
+    return f"{prefix}-{safe_slug(config.model_name)}-{config.num_example}-{config.data_path.split('/')[2]}-{date}"
 
-    return {
-        "input_ids": input_ids_tensor,
-        "labels": label_tensor,
-        "response_mask": response_mask_tensor
-    }
 
-def get_response_log_probs(
-    model: torch.nn.Module,
-    input_ids: torch.Tensor,
-    labels: torch.Tensor,
-    return_token_entropy: bool = False
-) -> dict[str, torch.Tensor]:
+def save_model_and_tokenizer(model, tokenizer, config):
+    out_dir = Path(f"./{config.experiment_name_base}/{config.experiment_name}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    model.save_pretrained(out_dir)
+    tokenizer.save_pretrained(out_dir)
+
+    print(f"Model and tokenizer saved to {out_dir}")
+
+
+def print_formatted_dict(data: dict) -> None:
+    """Pretty print a dictionary with indentation and color-friendly formatting."""
+    print(json.dumps(data, indent=4, ensure_ascii=False))
+
+
+def print_rich_dict(data: dict) -> None:
+    """Pretty print dictionary with colors using rich."""
+    from rich.pretty import pprint
+
+    pprint(data, expand_all=True)
+
+
+def print_color(text: str, color: str = "red"):
+    print(f"[{color}]{text}[/{color}]")
+
+
+def cycle_dataloader(dataloader):
     """
-    input: model, input_ids, labels
-    output: log_softmax(b s) and entropy(b s)
+    Creates a cycling iterator for a PyTorch DataLoader.
     """
-    logits = model(input_ids).logits   # b s v
-    log_softmax = torch.nn.functional.log_softmax(logits)  # b s v
-    label_token_log_softmax = log_softmax.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1) # b s
-
-    if return_token_entropy:
-        entropy = compute_entropy(logits)
-        return {
-            "log_probs": label_token_log_softmax,
-            "token_entropy": entropy
-        }
-    else:
-        return {
-            "log_probs": label_token_log_softmax
-        }
-
-def masked_normalize(
-        tensor: torch.Tensor,
-        mask: torch.Tensor,
-        dim: int | None=None,
-        normalize_constant: float = 1.0,
-) -> torch.Tensor:
-    masked_tensor = torch.where(mask, tensor, torch.zeros_like(tensor)) # b s
-    return torch.sum(masked_tensor, dim=dim) / normalize_constant
-
-def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
-    ### logits: b s v
-    ### return: b s
-    logp = torch.nn.functional.log_softmax(logits, dim=-1)
-    p = torch.exp(logp)
-    ce = -torch.sum(p*logp, dim=-1)
-    return ce
-    
-def sft_microbatch_train_step(
-        policy_log_probs: torch.Tensor,
-        response_mask: torch.Tensor,
-        gradient_accumulation_steps: int,
-        normalize_constant: float = 1.0,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    masked_normalized_probs = masked_normalize(
-        policy_log_probs, response_mask, -1, normalize_constant
-    )
-    loss = -masked_normalized_probs.mean()   # 除以句子数量
-    loss = loss / gradient_accumulation_steps
-    loss.backward()
-
-    return loss, {}
+    while True:
+        for batch in dataloader:
+            yield batch

@@ -1,8 +1,8 @@
 import torch
 from einops import repeat
 from typing import Literal
-from utils import masked_normalize
-def compute_group_normalized_reward(
+from .sft_utils import masked_normalize
+def compute_group_normalized_rewards(
     reward_fn,
     rollout_responses,
     repeated_ground_truths,
