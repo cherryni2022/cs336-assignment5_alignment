@@ -84,19 +84,27 @@ def main(
     out_dir = Path("evaluations")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / f"evaluate_{model_tag}_{data_stem}.jsonl"
+    incohert_file = out_dir / f"evaluate_{model_tag}_{data_stem}_incoherent.jsonl"
     correct_count = 0
     format_rewards = 0
     answer_reward = 0
     reward = 0
     with open(out_file, "w", encoding="utf-8") as f:
-        for i in results:
-            if i["extracted_answer"] == i["true_answer"]:
+        for result in results:
+            if result["extracted_answer"] == result["true_answer"]:
                 correct_count += 1
-            format_rewards += i["format_reward"]
-            answer_reward += i["answer_reward"]
-            reward += i["reward"]
-            json.dump(i, f)
+            format_rewards += result["format_reward"]
+            answer_reward += result["answer_reward"]
+            reward += result["reward"]
+            json.dump(result, f)
             f.write("\n")
+    
+    # 确认correct_count 与 reward 不一致的问题
+    with open(incohert_file, "w", encoding="utf-8") as f:
+        for result in results:
+            if result["extracted_answer"] == result["true_answer"]:
+                json.dump(result, f)
+                f.write("\n")
 
     print_color(f"Correct answers: {correct_count}/{len(results)}", "green")
     print_color(f"Format rewards: {format_rewards}/{len(results)}", "green")

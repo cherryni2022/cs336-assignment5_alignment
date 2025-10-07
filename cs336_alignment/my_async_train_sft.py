@@ -17,6 +17,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 import json
 
+import threading
+import queue
+import copy
+from concurrent.futures import ThreadPoolExecutor, Future
+from typing import Optional
+
+
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.data_utils import extract_reference_answer, extract_gsm8k_answer, load_and_format_prompts
 from cs336_alignment.sft_utils import (
@@ -89,6 +96,64 @@ class EvaluateConfig:
     top_p: float = 1.0
     max_tokens: int = 1024
 
+class AsyncEvaluator:
+    def __init__(self, eval_config: EvaluateConfig, vllm: LLM):
+        self.eval_config = eval_config
+        self.vllm = vllm
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eval")
+        self.current_eval_future: Optional[Future] = None
+        
+    def start_async_evaluation(self, model: torch.nn.Module, eval_step: int) -> Future:
+        """异步启动评估任务"""
+        # 等待上一个评估完成
+        if self.current_eval_future and not self.current_eval_future.done():
+            logging.warning(f"Previous evaluation still running, waiting...")
+            self.current_eval_future.result()  # 阻塞等待完成
+            
+        # 创建模型权重的深拷贝到CPU
+        model.eval()
+        model.tie_weights()
+        cpu_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        model.train()
+        
+        # 提交异步评估任务
+        self.current_eval_future = self.executor.submit(
+            self._evaluate_async, cpu_state_dict, eval_step
+        )
+        return self.current_eval_future
+        
+    def _evaluate_async(self, cpu_state_dict: dict, eval_step: int):
+        """异步评估的实际执行函数"""
+        try:
+            logging.info(f"[async_eval] Starting evaluation for step {eval_step}")
+            
+            # 加载权重到vLLM实例
+            llm_model = self.vllm.llm_engine.model_executor.driver_worker.model_runner.model
+            llm_model.load_weights(cpu_state_dict.items())
+            torch.cuda.synchronize(torch.device("cuda:1"))
+            
+            # 执行评估
+            evaluate_sft_model(self.eval_config, self.vllm, eval_step=eval_step)
+            
+            logging.info(f"[async_eval] Evaluation completed for step {eval_step}")
+            
+        except Exception as e:
+            logging.error(f"[async_eval] Evaluation failed for step {eval_step}: {e}")
+            raise
+        finally:
+            # 清理CPU内存
+            del cpu_state_dict
+            torch.cuda.empty_cache()
+            
+    def wait_for_completion(self):
+        """等待当前评估完成"""
+        if self.current_eval_future:
+            self.current_eval_future.result()
+            
+    def shutdown(self):
+        """关闭异步评估器"""
+        self.wait_for_completion()
+        self.executor.shutdown(wait=True)
 # evaluate阶段log信息
 # 给定的提示（例如，从验证集中采样）生成响应。为每个示例记录以下内容是个好主意：
 # 1. 输入提示。
@@ -366,100 +431,106 @@ def train_sft_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate, betas=train_config.betas)
     print("[train] Optimizer initialized")
     
+     # 创建异步评估器
+    async_evaluator = AsyncEvaluator(eval_config, vllm) if evaluate else None
     # step4:训练模型
-    for sft_step in range(train_config.n_sft_steps):
-        batch_loss = 0
-        for curr_grad_accum_step in range(train_config.gradient_accumulation_steps):
-            # 从dataloader中获取一个micro_batch的训练数据
-            batch = next(iter(train_dataloader))
-            input_ids = batch["input_ids"].to(train_config.train_device)
-            labels = batch["labels"].to(train_config.train_device)
-            response_mask = batch["response_mask"].to(train_config.train_device)
+    try:
+        for sft_step in range(train_config.n_sft_steps):
+            batch_loss = 0
+            for curr_grad_accum_step in range(train_config.gradient_accumulation_steps):
+                # 从dataloader中获取一个micro_batch的训练数据
+                batch = next(iter(train_dataloader))
+                input_ids = batch["input_ids"].to(train_config.train_device)
+                labels = batch["labels"].to(train_config.train_device)
+                response_mask = batch["response_mask"].to(train_config.train_device)
 
-            with ctx:
-                log_prob_response = get_response_log_probs(model=model, 
-                                    input_ids=input_ids, labels=labels, 
-                                    return_token_entropy=True)
-                log_prob = log_prob_response["log_probs"]
-                entropy = log_prob_response["token_entropy"]
-                # 计算loss & backward()
-                loss, _ = sft_microbatch_train_step(
-                    log_prob, response_mask, train_config.gradient_accumulation_steps
-                )
-                logging.info(f"[train test log] Step {sft_step} | "
-                        f"Gradient accumulation step {curr_grad_accum_step} | "
+                with ctx:
+                    log_prob_response = get_response_log_probs(model=model, 
+                                        input_ids=input_ids, labels=labels, 
+                                        return_token_entropy=True)
+                    log_prob = log_prob_response["log_probs"]
+                    entropy = log_prob_response["token_entropy"]
+                    # 计算loss & backward()
+                    loss, _ = sft_microbatch_train_step(
+                        log_prob, response_mask, train_config.gradient_accumulation_steps
+                    )
+                    logging.info(f"[train test log] Step {sft_step} | "
+                            f"Gradient accumulation step {curr_grad_accum_step} | "
+                            f" | response_mask_entropy: {entropy[response_mask].mean().item():.6f}"
+                            f" | Global Entropy: {entropy.mean().item():.6f}"
+                            f" | Prompt Entropy: {entropy[~response_mask].mean().item():.6f}"
+                            f" | Loss: {loss.item():.4f}")
+
+                batch_loss += loss
+
+                # 累积梯度更新参数
+                if curr_grad_accum_step == train_config.gradient_accumulation_steps - 1:
+                    # 梯度裁剪
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    adj_lr = get_lr(sft_step, train_config.learning_rate, train_config.n_sft_steps)
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = adj_lr
+                    # 更新参数
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                    logging.info(
+                        f"[train] Step result summary at step_{sft_step}: "
+                        f" | accumulate_batch_loss: {batch_loss:.4f}"
+                        f" | avg_loss: {batch_loss / train_config.gradient_accumulation_steps:.4f}"
                         f" | response_mask_entropy: {entropy[response_mask].mean().item():.6f}"
                         f" | Global Entropy: {entropy.mean().item():.6f}"
                         f" | Prompt Entropy: {entropy[~response_mask].mean().item():.6f}"
-                        f" | Loss: {loss.item():.4f}")
+                        f" | adj_lr: {adj_lr:.6f}"
+                    )
 
-            batch_loss += loss
+                    wandb.log(
+                        {
+                            "train_step": sft_step + 1,
+                            "train/accumulate_batch_loss": to_float(batch_loss),
+                            "train/avg_loss": to_float(batch_loss / train_config.gradient_accumulation_steps),
+                            "train/entropy": to_float(entropy.mean()),
+                            "train/response entropy": to_float(entropy[response_mask].mean()),
+                            "train/prompt entropy": to_float(entropy[~response_mask].mean()),
+                            "train/lr": adj_lr,
+                        }
+                    )
 
-            # 累积梯度更新参数
-            if curr_grad_accum_step == train_config.gradient_accumulation_steps - 1:
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                adj_lr = get_lr(sft_step, train_config.learning_rate, train_config.n_sft_steps)
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = adj_lr
-                # 更新参数
-                optimizer.step()
-                optimizer.zero_grad()
+            # if (sft_step + 1) % train_config.log_print_steps == 0 and evaluate:
+            #     load_model_into_vllm_instance(model, vllm)
+            #     log_generations(
+            #         vllm,
+            #         reward_fn=r1_zero_reward_fn,
+            #         prompts=train_dataset.train_prompts,
+            #         cot=train_dataset.train_cot,
+            #         answers=train_dataset.train_answers,
+            #         eval_sampling_params=SamplingParams(
+            #             temperature=eval_config.temperature,
+            #             top_p=eval_config.top_p,
+            #             max_tokens=eval_config.max_tokens,
+            #             stop=["</answer>"],
+            #             include_stop_str_in_output=True,
+            #         ),
+            #         cur_step=sft_step,
+            #         num_example=3,
+            #     )
 
+            #迭代eval_interval_steps次后, vllm评估模型
+            if (sft_step + 1) % train_config.eval_interval_steps == 0 and evaluate:
                 logging.info(
-                    f"[train] Step result summary at step_{sft_step}: "
-                    f" | accumulate_batch_loss: {batch_loss:.4f}"
-                    f" | avg_loss: {batch_loss / train_config.gradient_accumulation_steps:.4f}"
-                    f" | response_mask_entropy: {entropy[response_mask].mean().item():.6f}"
-                    f" | Global Entropy: {entropy.mean().item():.6f}"
-                    f" | Prompt Entropy: {entropy[~response_mask].mean().item():.6f}"
-                    f" | adj_lr: {adj_lr:.6f}"
+                    f"[train] Step_{sft_step}: saving model at {train_config.experiment_name}_{train_config.num_train_samples}"
                 )
+                save_model_and_tokenizer(model, tokenizer, train_config)
 
-                wandb.log(
-                    {
-                        "train_step": sft_step + 1,
-                        "train/accumulate_batch_loss": to_float(batch_loss),
-                        "train/avg_loss": to_float(batch_loss / train_config.gradient_accumulation_steps),
-                        "train/entropy": to_float(entropy.mean()),
-                        "train/response entropy": to_float(entropy[response_mask].mean()),
-                        "train/prompt entropy": to_float(entropy[~response_mask].mean()),
-                        "train/lr": adj_lr,
-                    }
-                )
-
-        # if (sft_step + 1) % train_config.log_print_steps == 0 and evaluate:
-        #     load_model_into_vllm_instance(model, vllm)
-        #     log_generations(
-        #         vllm,
-        #         reward_fn=r1_zero_reward_fn,
-        #         prompts=train_dataset.train_prompts,
-        #         cot=train_dataset.train_cot,
-        #         answers=train_dataset.train_answers,
-        #         eval_sampling_params=SamplingParams(
-        #             temperature=eval_config.temperature,
-        #             top_p=eval_config.top_p,
-        #             max_tokens=eval_config.max_tokens,
-        #             stop=["</answer>"],
-        #             include_stop_str_in_output=True,
-        #         ),
-        #         cur_step=sft_step,
-        #         num_example=3,
-        #     )
-
-        #迭代eval_interval_steps次后, vllm评估模型
-        if (sft_step + 1) % train_config.eval_interval_steps == 0 and evaluate:
-            logging.info(
-                f"[train] Step {sft_step}: saving model at {train_config.experiment_name}_{train_config.num_train_samples}"
-            )
-            save_model_and_tokenizer(model, tokenizer, train_config)
-
-            # Run evaluatoin
-            logging.info(f"[eval] at step_{sft_step} start ==================")
-            load_model_into_vllm_instance(model, vllm)
-            evaluate_sft_model(eval_config, vllm, eval_step=sft_step)
-            logging.info(f"[eval] Evaluation completed for step_{sft_step}=====================")
-
+                # Run async evaluatoin
+                logging.info(f"[eval] at step_{sft_step} start async evaluation==================")
+                eval_future = async_evaluator.start_async_evaluation(model, sft_step)
+                # load_model_into_vllm_instance(model, vllm)
+                # evaluate_sft_model(eval_config, vllm, eval_step=sft_step)
+                logging.info(f"[eval] Evaluation completed for step_{sft_step}=====================")
+    finally:
+        if async_evaluator:
+            async_evaluator.shutdown()
 
 def main(
     *,
