@@ -1,6 +1,6 @@
 *.bin
 models/
-data/
+#data/
 
 nav
 tags
