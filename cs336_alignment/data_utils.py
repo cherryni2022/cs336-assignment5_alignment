@@ -82,6 +82,24 @@ def load_and_format_prompts(data_path: str, prompt_path: str) -> tuple[list[str]
 
     return prompts, cot, answers
 
+def load_and_format_prompts_with_original_data(data_path: str, prompt_path: str) -> tuple[list[str], list[str], list[str]]:
+    with open(prompt_path, "r") as file:
+        prompt = file.read()
+
+    prompts = []
+    cot = []
+    answers = []
+    original_data = []
+    with open(data_path, "r") as file:
+        for line in file:
+            data = json.loads(line)
+            prompts.append(prompt.format(question=data["question"]))
+            cot.append(convert_cot_to_think_answer(data["answer"]))
+            answers.append(extract_gsm8k_answer(data["answer"]))
+            original_data.append(line)
+
+    return prompts, cot, answers, original_data
+
 
 def load_json_to_list(file_path: str) -> list[dict]:
     data_list = []

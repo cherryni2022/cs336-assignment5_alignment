@@ -50,6 +50,7 @@ class TrainConfig:
     model_name: str = "Qwen/Qwen2.5-Math-1.5B"
     local_model_path: str = os.path.join(PROJECT_DIR, "models/Qwen2.5-Math-1.5B-Base")
     train_data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train.jsonl")
+    train_correct_data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train_correct.jsonl")
     prompt_path: str = os.path.join(PROJECT_DIR, "cs336_alignment/prompts/r1_zero.prompt")
 
     # 控制train 的参数变量
@@ -200,6 +201,44 @@ def sft_collate_fn(batch, tokenizer):
     batch_enc = tokenize_prompt_and_output(prompts, cot, tokenizer)
 
     return {**batch_enc, "answers": answers}
+
+def collect_correct_samples(
+    vllm_model: LLM,
+    reward_fn: Callable[[str, str], dict[str, float]],
+    prompts: List[str],
+    cots: List[str],
+    answers: List[str],
+    train_config: TrainConfig,
+) -> tuple[list[str], list[str]]:
+    """Return (correct_prompts, correct_outputs) where reward==1."""
+    correct_prompts: list[str] = []
+    correct_cots: list[str] = []
+    correct_outputs: list[str] = []
+    correct_answers: list[str] = []
+
+    # Ensure we sample multiple outputs per prompt.
+    sampling_params = SamplingParams(
+        temperature=train_config.ei_temperature,
+        top_p=train_config.ei_top_p,
+        max_tokens=train_config.ei_max_tokens,
+        stop=train_config.ei_stop_tokens,
+        include_stop_str_in_output=train_config.ei_include_stop_str_in_output,
+        min_tokens=train_config.ei_min_tokens,
+        n=1,
+    )
+
+    all_responses = vllm_model.generate(prompts, sampling_params)
+    for question, cot, answer, responses in zip(prompts, cots, answers, all_responses):
+        for _, response in enumerate(responses.outputs):
+            # compute reward
+            result = reward_fn(response.text, str(answer))
+            if result.get("reward", 0) == 1:
+                correct_prompts.append(question)
+                correct_cots.append(cot)
+                correct_outputs.append(response.text)
+                correct_answers.append(str(answer))
+
+    return correct_prompts, correct_cots, correct_answers
 
 def evaluate_vllm(vllm_model: LLM,
     reward_fn: Callable[[str, str], dict[str, float]],
@@ -490,8 +529,12 @@ def main(
     train_config.micro_batch_size = micro_batch_size
     train_config.sft_train_batch_size = train_batch_size
     train_config.gradient_accumulation_steps = train_batch_size // micro_batch_size
+    train_data_path = train_config.train_data_path
+    if use_correct:
+        # collect 经过vllm model 评估为correct samples
+        train_data_path = train_config.train_correct_data_path
     logging.info(f"[train_config reset] TrainConfig local_model_path: {train_config.local_model_path},"
-                f" train_data_path: {train_config.train_data_path}, "
+                f" train_data_path: {train_data_path}, "
                 f" sft_train_batch_size: {train_config.sft_train_batch_size}, "
                 f" gradient_accumulation_steps: {train_config.gradient_accumulation_steps}, "
                 f" micro_batch_size: {train_config.micro_batch_size}, "
@@ -500,9 +543,11 @@ def main(
     # 基于本地已经下载好的模型路径加载vLLM模型
     vllm = init_vllm(model_id=local_model_path, device=train_config.eval_device, seed=seed, gpu_memory_utilization=0.9)
     logging.info(f"init_vllm with model_id: {local_model_path}, device: {train_config.eval_device}, seed: {seed}, gpu_memory_utilization: 0.9")
+    
 
-    prompts, cot, answers = load_and_format_prompts(train_config.train_data_path, train_config.prompt_path)
-    logging.info(f"load train data from {train_config.train_data_path}, dataset size: {len(prompts)}")
+    prompts, cot, answers = load_and_format_prompts(train_data_path, train_config.prompt_path)
+    logging.info(f"load train data from {train_data_path}, dataset size: {len(prompts)}")
+    
     for train_sample_num in train_samples:
         # ---------------------
         # Load Model and tokenizer
