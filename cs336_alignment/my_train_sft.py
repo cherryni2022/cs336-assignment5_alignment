@@ -454,7 +454,7 @@ def train_sft_model(
             logging.info(
                 f"[train] Step {sft_step}: saving model at {train_config.experiment_name}_{train_config.num_train_samples}"
             )
-            save_model_and_tokenizer(model, tokenizer, train_config)
+            save_model_and_tokenizer(model, tokenizer, train_config, f"train_samples_{train_config.num_train_samples}")
 
             # Run evaluatoin
             logging.info(f"[eval] at step_{sft_step} start ==================")
@@ -462,6 +462,8 @@ def train_sft_model(
             evaluate_sft_model(eval_config, vllm, eval_step=sft_step)
             logging.info(f"[eval] Evaluation completed for step_{sft_step}=====================")
 
+    logging.info(f"[train] finish train steps:{train_config.n_sft_steps}, save model.....")
+    save_model_and_tokenizer(model, tokenizer, train_config, f"train_samples_{train_config.num_train_samples}")
 
 def main(
     *,

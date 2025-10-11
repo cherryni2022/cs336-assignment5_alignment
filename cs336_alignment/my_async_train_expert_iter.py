@@ -25,6 +25,7 @@ from cs336_alignment.sft_utils import (
     sft_microbatch_train_step,
     tokenize_prompt_and_output,
 )
+#from cs336_alignment.my_async_train_sft import AsyncEvaluator
 from cs336_alignment.utils import (
     get_run_name,
     print_rich_dict,
@@ -98,7 +99,7 @@ class TrainEIConfig:
     log_print_steps: int = 12
 
     eval_device: str = "cuda:1"
-    eval_steps: int = 16
+    eval_interval_steps: int = 16
 
     # Learning Rate adjust
     lr_mode: str = "global"  # one of: "global", "per_outer", "constant"
@@ -125,6 +126,65 @@ class EvaluateConfig:
     stop_tokens: list[str] = ["</answer>"]
     max_tokens: int = 1024
     include_stop_str_in_output: bool = True
+
+class AsyncEvaluator:
+    def __init__(self, eval_config: EvaluateConfig, vllm: LLM):
+        self.eval_config = eval_config
+        self.vllm = vllm
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eval")
+        self.current_eval_future: Optional[Future] = None
+        
+    def start_async_evaluation(self, model: torch.nn.Module, eval_step: int) -> Future:
+        """异步启动评估任务"""
+        # 等待上一个评估完成
+        if self.current_eval_future and not self.current_eval_future.done():
+            logging.warning(f"Previous evaluation still running, waiting...")
+            self.current_eval_future.result()  # 阻塞等待完成
+            
+        # 创建模型权重的深拷贝到CPU
+        model.eval()
+        model.tie_weights()
+        cpu_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        model.train()
+        
+        # 提交异步评估任务
+        self.current_eval_future = self.executor.submit(
+            self._evaluate_async, cpu_state_dict, eval_step
+        )
+        return self.current_eval_future
+        
+    def _evaluate_async(self, cpu_state_dict: dict, eval_step: int):
+        """异步评估的实际执行函数"""
+        try:
+            logging.info(f"[async_eval] Starting evaluation for step {eval_step}")
+            
+            # 加载权重到vLLM实例
+            llm_model = self.vllm.llm_engine.model_executor.driver_worker.model_runner.model
+            llm_model.load_weights(cpu_state_dict.items())
+            torch.cuda.synchronize(torch.device("cuda:1"))
+            
+            # 执行评估
+            evaluate_sft_model(self.eval_config, self.vllm, eval_step=eval_step)
+            
+            logging.info(f"[async_eval] Evaluation completed for step {eval_step}")
+            
+        except Exception as e:
+            logging.error(f"[async_eval] Evaluation failed for step {eval_step}: {e}")
+            raise
+        finally:
+            # 清理CPU内存
+            del cpu_state_dict
+            torch.cuda.empty_cache()
+            
+    def wait_for_completion(self):
+        """等待当前评估完成"""
+        if self.current_eval_future:
+            self.current_eval_future.result()
+            
+    def shutdown(self):
+        """关闭异步评估器"""
+        self.wait_for_completion()
+        self.executor.shutdown(wait=True)
 
 # train.jsonl全量数据集,用于每轮专家迭代步骤中采样Db question
 class ExpertTrainDataSet(Dataset):
@@ -202,6 +262,7 @@ def train_sft_model(
     optimizer,
     tokenizer,
     vllm,
+    async_evaluator,
     train_config: TrainEIConfig,
     train_prompts,
     train_cot,
@@ -318,13 +379,18 @@ def train_sft_model(
         global_sft_step += 1
 
         if (global_sft_step % train_config.eval_steps == 0):
-            load_model_into_vllm_instance(model, vllm)
+            
             # evaluate model & wandb.log 信息
-            evaluate_sft_model(eval_config, vllm, global_sft_step)
+            logging.info(
+                f"[trainSFT | ei step_{curr_ei_steps} sft_global step_{global_sft_step}]: "
+                f"saving model at {train_config.experiment_name}/ei_rollout_samples_{train_config.sample_questions_per_ei_step}"
+            )
             save_model_and_tokenizer(model, tokenizer, train_config, f"ei_rollout_samples_{train_config.sample_questions_per_ei_step}")
-
+            #load_model_into_vllm_instance(model, vllm)
+            #evaluate_sft_model(eval_config, vllm, global_sft_step)
+            eval_future = async_evaluator.start_async_evaluation(model, global_sft_step)
+            
         
-
     return total_loss / train_config.training_steps, global_sft_step
 
 # 实验要求:
@@ -392,6 +458,9 @@ def train_ei_model(
         include_stop_str_in_output=eval_config.include_stop_str_in_output,
     )
 
+     # 创建异步评估器
+    async_evaluator = AsyncEvaluator(eval_config, vllm)
+
     # prepare data loader
     base_ds = ExpertTrainDataSet(train_config.train_data_path, train_config.prompt_path)
     base_data_loader = DataLoader(
@@ -438,6 +507,7 @@ def train_ei_model(
             tokenizer = tokenizer,
             optimizer = optimizer,
             vllm = vllm,
+            async_evaluator = async_evaluator,
             train_config = train_config,
             train_prompts = correct_prompts,
             train_cot = correct_outputs,
@@ -452,8 +522,8 @@ def train_ei_model(
         # 一次sft训练结束, eval_model= model, 后一次ei_step 将利用eval_model对抽样数据采集outputs
         load_model_into_vllm_instance(model, vllm)
     
-    
-    save_model_and_tokenizer(model, tokenizer, train_config, f"ei_rollout_samples_{train_config.sample_questions_per_ei_step}")
+    # TODO: save path
+    save_model_and_tokenizer(model, tokenizer, train_config, f"final_step_{global_step}")
     wandb.finish()
 
     return model

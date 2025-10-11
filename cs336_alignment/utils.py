@@ -24,8 +24,8 @@ def get_run_name(prefix: str, config):
     return f"{prefix}-{safe_slug(config.model_name)}-{config.num_example}-{config.data_path.split('/')[2]}-{date}"
 
 
-def save_model_and_tokenizer(model, tokenizer, config):
-    out_dir = Path(f"./{config.experiment_name_base}/{config.experiment_name}/{config.num_train_samples}")
+def save_model_and_tokenizer(model, tokenizer, config, curr_experiment_name):
+    out_dir = Path(f"./{config.experiment_name_base}/{config.experiment_name}/{curr_experiment_name}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     model.save_pretrained(out_dir)
