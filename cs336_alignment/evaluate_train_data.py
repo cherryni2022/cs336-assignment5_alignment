@@ -2,11 +2,12 @@ import json
 import logging
 from pathlib import Path
 from typing import Callable, List, Union
+from dataclasses import asdict, dataclass, field
 
 import fire
 from vllm import LLM, SamplingParams
 
-from cs336_alignment.data_utils import extract_reference_answer, load_and_format_prompts
+from cs336_alignment.data_utils import extract_reference_answer, load_and_format_prompts, load_and_format_prompts_with_original_data
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.utils import print_color, safe_slug
 import os
@@ -14,7 +15,10 @@ import os
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 logging.getLogger("vllm").setLevel(logging.WARNING)
-
+logging.basicConfig(
+    format="%(asctime)s - %(module)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 
 def get_vllm_response(vllm_model, prompts, sampling_params) -> List[str]:
     result = vllm_model.generate(prompts, sampling_params)
@@ -33,6 +37,7 @@ def evaluate_vllm(
 ):
     responses = get_vllm_response(vllm_model, prompts, eval_sampling_params)
     allinfo_dict_list = []
+    original_datas = []
     for response, true_answer, prompt, original_line in zip(responses, true_answers, prompts, original_data):
         extracted_answer = extract_reference_answer(response)
         reward_dict = reward_fn(response, true_answer)
@@ -42,19 +47,19 @@ def evaluate_vllm(
             "prompt": prompt,
             "response": response,
             "true_answer": true_answer,
-            "original_data": original_line,
             "extracted_answer": extracted_answer,
             **reward_dict,
         }
 
         allinfo_dict_list.append(info_dict)
+        original_datas.append(original_line)
 
-    return allinfo_dict_list
+    return allinfo_dict_list, original_datas
 
 temperature: float = 1.0
 top_p: float = 1.0
 max_tokens: int = 1024
-stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
+stop_tokens: list[str] = ["</answer>"]
 include_stop_str_in_output: bool = True
 min_tokens: int = 4
 
@@ -81,13 +86,13 @@ def main(
         stop=stop_tokens,
         include_stop_str_in_output=include_stop_str_in_output,
         min_tokens=min_tokens,
-        n=1,
+        #n=1,
     )
 
     # 保留原有的question, answer + prompt,cot,true_answer
     prompts, cot, true_answers, original_data = load_and_format_prompts_with_original_data(data_path, prompt_path)
 
-    results = evaluate_vllm(vllm_model, r1_zero_reward_fn, prompts, cot, true_answers, original_data, sampling_params)
+    reward_results, original_datas = evaluate_vllm(vllm_model, r1_zero_reward_fn, prompts, cot, true_answers, original_data, sampling_params)
 
     # Save the results
     model_tag = safe_slug(model_name)
@@ -101,7 +106,7 @@ def main(
     answer_reward = 0
     reward = 0
     with open(evaluate_out_file, "w", encoding="utf-8") as f:
-        for result in results:
+        for result in reward_results:
             if result["extracted_answer"] == result["true_answer"]:
                 correct_count += 1
             format_rewards += result["format_reward"]
@@ -112,17 +117,15 @@ def main(
     
 
     with open(correct_out_file, "w", encoding="utf-8") as f:
-        for result in results:
+        for result, original_data_line in zip(reward_results, original_datas):
             if result["reward"] == 1.0:
-                original_data_line = result["original_data"]
                 f.write(original_data_line)
-                f.write("\n")
 
-    print_color(f"Correct answers: {correct_count}/{len(results)}", "green")
-    print_color(f"Format rewards: {format_rewards}/{len(results)}", "green")
-    print_color(f"Answer rewards: {answer_reward}/{len(results)}", "green")
-    print_color(f"Total rewards: {reward}/{len(results)}", "green")
-    print(f"Wrote {out_file}")
+    print_color(f"Correct answers: {correct_count}/{len(reward_results)}", "green")
+    print_color(f"Format rewards: {format_rewards}/{len(reward_results)}", "green")
+    print_color(f"Answer rewards: {answer_reward}/{len(reward_results)}", "green")
+    print_color(f"Total rewards: {reward}/{len(reward_results)}", "green")
+    print(f"Wrote {evaluate_out_file}")
 
 
 if __name__ == "__main__":

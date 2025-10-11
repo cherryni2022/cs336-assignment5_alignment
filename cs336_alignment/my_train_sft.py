@@ -202,43 +202,6 @@ def sft_collate_fn(batch, tokenizer):
 
     return {**batch_enc, "answers": answers}
 
-def collect_correct_samples(
-    vllm_model: LLM,
-    reward_fn: Callable[[str, str], dict[str, float]],
-    prompts: List[str],
-    cots: List[str],
-    answers: List[str],
-    train_config: TrainConfig,
-) -> tuple[list[str], list[str]]:
-    """Return (correct_prompts, correct_outputs) where reward==1."""
-    correct_prompts: list[str] = []
-    correct_cots: list[str] = []
-    correct_outputs: list[str] = []
-    correct_answers: list[str] = []
-
-    # Ensure we sample multiple outputs per prompt.
-    sampling_params = SamplingParams(
-        temperature=train_config.ei_temperature,
-        top_p=train_config.ei_top_p,
-        max_tokens=train_config.ei_max_tokens,
-        stop=train_config.ei_stop_tokens,
-        include_stop_str_in_output=train_config.ei_include_stop_str_in_output,
-        min_tokens=train_config.ei_min_tokens,
-        n=1,
-    )
-
-    all_responses = vllm_model.generate(prompts, sampling_params)
-    for question, cot, answer, responses in zip(prompts, cots, answers, all_responses):
-        for _, response in enumerate(responses.outputs):
-            # compute reward
-            result = reward_fn(response.text, str(answer))
-            if result.get("reward", 0) == 1:
-                correct_prompts.append(question)
-                correct_cots.append(cot)
-                correct_outputs.append(response.text)
-                correct_answers.append(str(answer))
-
-    return correct_prompts, correct_cots, correct_answers
 
 def evaluate_vllm(vllm_model: LLM,
     reward_fn: Callable[[str, str], dict[str, float]],
