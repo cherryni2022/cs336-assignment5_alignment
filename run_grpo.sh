@@ -10,6 +10,7 @@ group_size=8
 epochs_per_rollout_batch=1 # On-policy
 train_batch_size=256
 micro_batch_size=8
+use_std_normalization=True
 #gradient_accumulation_steps = 128 # microbatch size is 2, will fit on H100 gpu_memory_utilization: float = 0.85
 loss_type="reinforce_with_baseline"
 sub_experiment="adj_lr"

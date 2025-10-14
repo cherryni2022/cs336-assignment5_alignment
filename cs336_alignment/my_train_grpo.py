@@ -220,6 +220,7 @@ class GRPORolloutDataset(Dataset):
 
         # We need calculate the old log probs using old model,
         self.old_log_probs, self.token_entropy = get_old_log_probs(model, input_ids, labels, train_config)
+        print_color("Generate Rollout Dataset Done.")
 
     def __len__(self):
         return len(self.input_ids)
@@ -299,7 +300,7 @@ def update_policy(
             raw_rewards_micro = raw_rewards[start_index:end_index]
             old_log_probs_micro = old_log_probs[start_index:end_index]
             with ctx:
-                log_probs_dict = get_response_log_probs(model=model, input_ids=input_ids_micro, labels=labels_micro)
+                log_probs_dict = get_response_log_probs(model=model, input_ids=input_ids_micro, labels=labels_micro, return_token_entropy=True)
                 log_probs = log_probs_dict["log_probs"]
                 entropy = log_probs_dict["token_entropy"]
                 policy_log_probs = log_probs.to(train_config.train_device)
@@ -485,6 +486,7 @@ def train_grpo(
             advantages=advantages_train,
             tokenizer=tokenizer,
             global_train_step=global_step,
+            grpo_step=grpo_step,
         )
 
         # Evaluate
@@ -602,10 +604,10 @@ if __name__ == "__main__":
     parser.add_argument("--rollout_batch_size", type=int, default=256, help="total rollout samples per grpo step")
     parser.add_argument("--group_size", type=int, default=8, help="each grpo step sample group_size output per question")
     parser.add_argument("--epochs_per_rollout_batch", type=int, default=1, help="epochs_per_rollout_batch")
-    parser.add_argument("--use_std_normalization", type=bool, default=False, help="use_std_normalization")
+    parser.add_argument("--use_std_normalization", type=bool, default=True, help="use_std_normalization")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="learning_rate")
     # type:no_baseline,reinforce_with_baseline,grpo_clip
-    parser.add_argument("--loss_type", type=str, default="grpo_clip", help="loss_type in no_baseline,grpo_clip,reinforce_with_baseline")
+    parser.add_argument("--loss_type", type=str, default="reinforce_with_baseline", help="loss_type in no_baseline,grpo_clip,reinforce_with_baseline")
     parser.add_argument("--train_batch_size", type=int, default=256, help="train_batch_size")
     parser.add_argument("--micro_batch_size", type=int, default=8, help="micro_batch_size")
     
