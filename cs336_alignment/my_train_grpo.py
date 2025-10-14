@@ -17,7 +17,7 @@ import gc
 from dataclasses import asdict, dataclass, field
 from cs336_alignment.data_utils import load_and_format_prompts
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from cs336_alignment.grpo import compute_group_normalized_rewards, grpo_microbatch_train_step
+from cs336_alignment.grpo import compute_group_normalized_rewards, grpo_microbatch_train_step, masked_mean
 from cs336_alignment.sft_utils import get_response_log_probs, tokenize_prompt_and_output
 from cs336_alignment.utils import (
     clear,
@@ -42,6 +42,7 @@ logging.basicConfig(
 class TrainConfig:
     experiment_name_base: str = "experiments"
     experiment_name: str = "grpo-qwen2.5-math"
+    sub_experiment_name: str = "adj_lr"
     model_name: str = "Qwen/Qwen2.5-Math-1.5B"
     local_model_path: str = os.path.join(PROJECT_DIR, "models/Qwen2.5-Math-1.5B-Base")
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train.jsonl")
@@ -74,25 +75,25 @@ class TrainConfig:
     micro_train_batch_size: int = 8 # train_batch_size/gradient_accumulation_steps
 
     advantage_eps: float = 1e-6
-    use_std_normalization: bool = False
+    use_std_normalization: bool = True
     # type:no_baseline,reinforce_with_baseline,grpo_clip
-    loss_type: str = "grpo_clip"
+    loss_type: str = "reinforce_with_baseline"
     mixed_precision_training: bool = True
     # Optimizer
     learning_rate: float = 1e-5
     betas: tuple[float, float] = (0.9, 0.95)
 
-    eval_steps: int = 8
-
+    eval_steps: int = 2
+    
     eval_device: str = "cuda:1"
+    #eval_device: str = "cuda:1"
     train_device: str = "cuda:0"
 
     # For VLLM sampling
     temperature: float = 1.0
     top_p: float = 1.0
     max_tokens: int = 1024
-    #stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
-    stop_tokens: list[str] = ["</answer>"]
+    stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
     include_stop_str_in_output: bool = True
     min_tokens: int = 4
     vllm_seed: int = 42
@@ -128,7 +129,7 @@ class EvaluateConfig:
     temperature: float = 1.0
     top_p: float = 1.0
     #stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
-    stop_tokens: list[str] = ["</answer>"]
+    stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
     max_tokens: int = 1024
     include_stop_str_in_output: bool = True
     eval_result_dir: str = os.path.join(PROJECT_DIR, "evaluations/grpo")
@@ -274,7 +275,7 @@ def update_policy(
     for train_step in range(train_config.train_steps_per_rollout_batch):
         # Fetch the next train_batch_size
         #train_batch = next(cycled_dataloader)
-        input_ids, labels, response_mask, raw_rewards, advantages, old_log_probs, entropy = next(cycled_dataloader)
+        input_ids, labels, response_mask, raw_rewards, advantages, old_log_probs = next(cycled_dataloader)
         input_ids = input_ids.to(train_config.train_device)
         labels = labels.to(train_config.train_device)
         response_mask = response_mask.to(train_config.train_device)
@@ -370,6 +371,7 @@ def train_grpo(
         name=f"train_grpo_lr{train_config.learning_rate}_{train_config.loss_type}_{policy_type}_{date_str}",
         config={
             "n_grpo_steps": train_config.n_grpo_steps,
+            "grpo_learning_rate": train_config.learning_rate,
             "grpo_rollout_batch_size": train_config.rollout_batch_size,
             "grpo_group_size": train_config.group_size,
             "grpo_epochs_per_rollout_batch": train_config.epochs_per_rollout_batch,
@@ -472,6 +474,7 @@ def train_grpo(
             normalized_by_std=train_config.use_std_normalization,
         )
 
+
         global_step = update_policy(
             model=model,
             optimizer=optimizer,
@@ -511,9 +514,9 @@ def train_grpo(
             #     "eval_step": eval_step,}
             # )
 
-            save_model_and_tokenizer(model, tokenizer, train_config)
+            save_model_and_tokenizer(model, tokenizer, train_config, train_config.sub_experiment_name)
 
-        save_model_and_tokenizer(model, tokenizer, train_config)
+        save_model_and_tokenizer(model, tokenizer, train_config, train_config.sub_experiment_name)
 
     print("Grpo Training Finished")
 
@@ -528,6 +531,7 @@ def main(
     loss_type: str,
     train_batch_size:int ,
     micro_batch_size: int,
+    sub_experiment_name: str,
     model_name: str = "Qwen/Qwen2.5-Math-1.5B",
     local_model_path: str = os.path.join(PROJECT_DIR, "models/Qwen2.5-Math-1.5B-Base"),
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train.jsonl"),
@@ -593,6 +597,7 @@ def main(
 # 实验控制变量:
 if __name__ == "__main__":
     parser = ArgumentParser()
+    parser.add_argument("--sub_experiment_name", type=str, default="adj_lr", help="sub_experiment_name")
     parser.add_argument("--n_grpo_steps", type=int, default=200, help="n_grpo_steps")
     parser.add_argument("--rollout_batch_size", type=int, default=256, help="total rollout samples per grpo step")
     parser.add_argument("--group_size", type=int, default=8, help="each grpo step sample group_size output per question")
@@ -615,4 +620,5 @@ if __name__ == "__main__":
                     loss_type=args.loss_type,
                     train_batch_size=args.train_batch_size,
                     micro_batch_size=args.micro_batch_size,
+                    sub_experiment_name=args.sub_experiment_name,
                     ))

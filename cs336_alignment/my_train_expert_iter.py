@@ -110,8 +110,7 @@ class TrainEIConfig:
     ei_temperature: float = 1.0
     ei_top_p: float = 1.0
     ei_max_tokens: int = 1024
-    #ei_stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
-    ei_stop_tokens: list[str] = ["</answer>"]
+    ei_stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
     ei_include_stop_str_in_output: bool = True
     ei_min_tokens: int = 4
 
@@ -121,8 +120,7 @@ class EvaluateConfig:
     prompt_path: str = os.path.join(PROJECT_DIR, "cs336_alignment/prompts/r1_zero.prompt")
     temperature: float = 1.0
     top_p: float = 1.0
-    #stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
-    stop_tokens: list[str] = ["</answer>"]
+    stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
     max_tokens: int = 1024
     include_stop_str_in_output: bool = True
     eval_result_dir: str = os.path.join(PROJECT_DIR, "evaluations/expert")
