@@ -125,6 +125,7 @@ class EvaluateConfig:
     stop_tokens: list[str] = ["</answer>"]
     max_tokens: int = 1024
     include_stop_str_in_output: bool = True
+    eval_result_dir: str = os.path.join(PROJECT_DIR, "evaluations/expert")
 
 # train.jsonl全量数据集,用于每轮专家迭代步骤中采样Db question
 class ExpertTrainDataSet(Dataset):

@@ -85,7 +85,7 @@ class TrainConfig:
 class EvaluateConfig:
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/test.jsonl")
     prompt_path: str = os.path.join(PROJECT_DIR, "cs336_alignment/prompts/r1_zero.prompt")
-    eval_result_dir: str = os.path.join(PROJECT_DIR, "evaluations")
+    eval_result_dir: str = os.path.join(PROJECT_DIR, "evaluations/sft")
     temperature: float = 1.0
     top_p: float = 1.0
     max_tokens: int = 1024

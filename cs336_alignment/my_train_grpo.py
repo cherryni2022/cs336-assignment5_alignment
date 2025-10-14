@@ -32,6 +32,10 @@ from cs336_alignment.my_train_sft import evaluate_sft_model, evaluate_vllm, log_
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 logging.getLogger("vllm").setLevel(logging.WARNING)
+logging.basicConfig(
+    format="%(asctime)s - %(module)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 
 
 @dataclass
@@ -39,11 +43,10 @@ class TrainConfig:
     experiment_name_base: str = "experiments"
     experiment_name: str = "grpo-qwen2.5-math"
     model_name: str = "Qwen/Qwen2.5-Math-1.5B"
-    local_model_path: str = os.path.join(PROJECT_DIR, "models/Qwen2.5-Math-1.5B")
+    local_model_path: str = os.path.join(PROJECT_DIR, "models/Qwen2.5-Math-1.5B-Base")
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train.jsonl")
     prompt_path: str = os.path.join(PROJECT_DIR, "cs336_alignment/prompts/r1_zero.prompt")
-    # TODO: ?
-    num_example: int = 7000
+
 
     # assignment 试验给出的参数 ------------------
     
@@ -56,7 +59,6 @@ class TrainConfig:
     # test n_grpo_steps: int = 10
     # grpo算法外循环
     n_grpo_steps: int = 200
-    rollout_batch_size: int = 256
     rollout_batch_size: int = 256 # 每个grpo迭代,抽样并rollout后构建用于train的总样本数
     # n_prompts_per_rollout_batch = rollout_batch_size // group_size
     n_prompts_per_rollout_batch: int = 32
@@ -67,19 +69,20 @@ class TrainConfig:
     # train_steps_per_rollout_batch = rollout_batch_size // train_batch_size
     train_steps_per_rollout_batch: int = 4
 
-    train_batch_size: int = 256 # On-policy
-    gradient_accumulation_steps: int = 128
-    micro_train_batch_size: int = 2 # train_batch_size/gradient_accumulation_steps
+    train_batch_size: int = 256
+    gradient_accumulation_steps: int = 32
+    micro_train_batch_size: int = 8 # train_batch_size/gradient_accumulation_steps
 
     advantage_eps: float = 1e-6
-    use_std_normalization: bool = True
-
+    use_std_normalization: bool = False
+    # type:no_baseline,reinforce_with_baseline,grpo_clip
+    loss_type: str = "grpo_clip"
     mixed_precision_training: bool = True
     # Optimizer
     learning_rate: float = 1e-5
     betas: tuple[float, float] = (0.9, 0.95)
 
-    eval_steps: int = 2
+    eval_steps: int = 8
 
     eval_device: str = "cuda:1"
     train_device: str = "cuda:0"
@@ -88,14 +91,15 @@ class TrainConfig:
     temperature: float = 1.0
     top_p: float = 1.0
     max_tokens: int = 1024
-    stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
+    #stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
+    stop_tokens: list[str] = ["</answer>"]
     include_stop_str_in_output: bool = True
     min_tokens: int = 4
     vllm_seed: int = 42
 
     def __post_init__(self):
-        assert self.train_batch_size % self.gradient_accumulation_steps == 0, "train_batch_size must be divisible by gradient_accumulation_steps"
-        self.micro_train_batch_size = self.train_batch_size // self.gradient_accumulation_steps
+        assert self.train_batch_size % self.micro_train_batch_size == 0, "train_batch_size must be divisible by micro_train_batch_size"
+        self.gradient_accumulation_steps = self.train_batch_size // self.micro_train_batch_size
         assert self.rollout_batch_size % self.group_size == 0, "rollout_batch_size must be divisible by group_size"
         self.n_prompts_per_rollout_batch = self.rollout_batch_size // self.group_size
         assert self.train_batch_size >= self.group_size, "train_batch_size must be greater than or equal to group_size"
@@ -108,7 +112,14 @@ class TrainConfig:
         self.train_batch_size = self.micro_train_batch_size * self.gradient_accumulation_steps
 
         self.train_steps_per_rollout_batch = total_train_data_per_grpo_step // self.train_batch_size
-
+        logging.info(f"[trainConfig] after init train_batch_size: {self.train_batch_size},"
+                    f"micro_train_batch_size:{self.micro_train_batch_size},"
+                    f"gradient_accumulation_steps: {self.gradient_accumulation_steps},"
+                    f"rollout_batch_size:{self.rollout_batch_size}, group_size:{self.group_size},"
+                    f"n_prompts_per_rollout_batch:{self.n_prompts_per_rollout_batch},"
+                    f"epochs_per_rollout_batch:{self.epochs_per_rollout_batch},"
+                    f"n_microbatches_per_rollout_batch:{self.n_microbatches_per_rollout_batch},"
+                    f"train_steps_per_rollout_batch:{self.train_steps_per_rollout_batch}")
 
 @dataclass
 class EvaluateConfig:
@@ -116,10 +127,13 @@ class EvaluateConfig:
     prompt_path: str = os.path.join(PROJECT_DIR, "cs336_alignment/prompts/r1_zero.prompt")
     temperature: float = 1.0
     top_p: float = 1.0
-    stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
+    #stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
+    stop_tokens: list[str] = ["</answer>"]
     max_tokens: int = 1024
     include_stop_str_in_output: bool = True
+    eval_result_dir: str = os.path.join(PROJECT_DIR, "evaluations/grpo")
 
+#原train.jsonl 数据集+prompt_template =>(prompt,cot,true_answer)
 class GRPODataset(Dataset):
     def __init__(self, train_prompts, train_cot, train_answers):
         self.train_prompts = train_prompts
@@ -149,7 +163,6 @@ def get_old_log_probs(
     labels = labels.to(train_config.train_device)
 
     # group_size 一组question 计算
-    # TODO: question_per_grpo_step什么含义
     for train_step in range(0, train_config.n_prompts_per_rollout_batch):
         start_index = train_step * train_config.group_size
         input_ids_part = input_ids[
@@ -231,6 +244,7 @@ def update_policy(
     advantages,
     tokenizer,
     global_train_step,
+    grpo_step,
 ):
     with torch.no_grad():
         dataset = GRPORolloutDataset(
@@ -256,19 +270,23 @@ def update_policy(
     )
 
     global_step_ = global_train_step
-    total_steps = 0
-    batch_loss = 0
+    # train_steps_per_rollout_batch = epoches * rollout_batch_size/train_batch_size
     for train_step in range(train_config.train_steps_per_rollout_batch):
         # Fetch the next train_batch_size
-        train_batch = next(cycled_dataloader)
-        input_ids, labels, response_mask, raw_rewards, advantages, old_log_probs, entropy = train_batch
+        #train_batch = next(cycled_dataloader)
+        input_ids, labels, response_mask, raw_rewards, advantages, old_log_probs, entropy = next(cycled_dataloader)
         input_ids = input_ids.to(train_config.train_device)
         labels = labels.to(train_config.train_device)
+        response_mask = response_mask.to(train_config.train_device)
         old_log_probs = old_log_probs.to(train_config.train_device)
         #old_entropy = entropy.to(train_config.train_device)
-        response_mask = response_mask.to(train_config.train_device)
         advantages = advantages.to(train_config.train_device)
         raw_rewards = raw_rewards.to(train_config.train_device)
+        
+        batch_mean_response_length = response_mask.sum(dim=-1).mean(dtype=torch.float32)
+        batch_loss = 0
+        accumulated_token_entropy = 0
+        accumulated_clip_fraction = 0
 
         for train_microstep in range(train_config.gradient_accumulation_steps):
             start_index = train_microstep * train_config.micro_train_batch_size
@@ -282,54 +300,57 @@ def update_policy(
             with ctx:
                 log_probs_dict = get_response_log_probs(model=model, input_ids=input_ids_micro, labels=labels_micro)
                 log_probs = log_probs_dict["log_probs"]
-                token_entropy = log_probs_dict["token_entropy"]
-                policy_log_probs = log_probs
-                policy_log_probs.to(device_train)
+                entropy = log_probs_dict["token_entropy"]
+                policy_log_probs = log_probs.to(train_config.train_device)
                 loss, metadata = grpo_microbatch_train_step(
                     policy_log_probs,
                     response_mask_micro,
                     train_config.gradient_accumulation_steps,
-                    loss_type="grpo_clip",
+                    loss_type=train_config.loss_type,
                     raw_rewards=raw_rewards_micro,
                     advantages=advantages_micro,
                     old_log_probs=old_log_probs_micro,
                     cliprange=0.2,
                 )
 
-                batch_loss += loss
+                #mean_advantage = metadata["mean_advantage"]
+                #clip_fraction = metadata["clip_fraction"]
+                avg_token_entropy = masked_mean(entropy, response_mask_micro, dim=None)
+                accumulated_token_entropy += avg_token_entropy.item()
+                accumulated_clip_fraction += masked_mean(metadata["clip_fraction"], response_mask_micro, dim=None).item()
+                batch_loss += loss.item()
 
-            total_steps += 1
+            if train_microstep == train_config.gradient_accumulation_steps - 1:
+                # gradient_accumulation_steps 训练完, 更新梯度
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
 
-        del input_ids
-        del labels
-        del old_log_probs
-        del response_mask
-        del advantages
-        del raw_rewards
-        clear()
+                logging.info(
+                    f"[train grpo] Step result summary at grpo step_{grpo_step}, global train_step_{global_step_ + 1}: "
+                    f" | accumulate_batch_loss: {batch_loss:.4f}"
+                    f" | avg_loss: {batch_loss / train_config.gradient_accumulation_steps:.4f}"
+                    f" | avg_response_entropy: {accumulated_token_entropy / train_config.gradient_accumulation_steps:.4f}"
+                    f" | avg_clip_fraction: {accumulated_clip_fraction / train_config.gradient_accumulation_steps:.4f}"
+                    f" | response_mask_entropy: {entropy[response_mask].mean().item():.6f}"
+                    f" | Global Entropy: {entropy.mean().item():.6f}"
+                    f" | Prompt Entropy: {entropy[~response_mask].mean().item():.6f}"
+                )
         
-        # gradient_accumulation_steps 训练完, 更新梯度
-        if (total_steps + 1) % train_config.gradient_accumulation_steps == 0:
-            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
-            optimizer.step()
-            optimizer.zero_grad()
+                wandb.log({
+                        "train/batch_loss": batch_loss,
+                        "train/avg_loss": batch_loss / train_config.gradient_accumulation_steps,
+                        "train/entropy": to_float(entropy.mean()),
+                        "train/response_entropy": to_float(entropy[response_mask].mean()),
+                        "train/avg_response_entropy": accumulated_token_entropy / train_config.gradient_accumulation_steps,
+                        "train/prompt_entropy": to_float(entropy[~response_mask].mean()),
+                        "train/avg_clip_fraction": accumulated_clip_fraction / train_config.gradient_accumulation_steps,
+                        "train/grad_norm": grad_norm,
+                        "train/mean_response_length": batch_mean_response_length,
+                        "train_step": global_step_ + 1
+                    }, step=global_step_)
 
-            print(
-                f"Step {global_step_ + 1} | Loss {batch_loss / train_config.gradient_accumulation_steps: .4f}"
-            )
-            # TODO: train/avg_token_entropy, avg_clip_fraction, batch_mean_response_length
-            wandb.log({
-                    "train/loss": loss.item() * train_config.gradient_accumulation_steps,
-                    "train/avg_token_entropy": metadata["avg_token_entropy"] / train_config.gradient_accumulation_steps,
-                    "train/avg_clip_fraction": metadata["avg_clip_fraction"] / train_config.gradient_accumulation_steps,
-                    "train/grad_norm": grad_norm,
-                    "train/mean_response_length": batch_mean_response_length,
-                    "train_step": global_step_ + 1
-                }, step=global_step_)
-
-            global_step_ += 1
-            batch_loss = 0
-
+        global_step_ += 1
 
     return global_step_
 
@@ -341,11 +362,23 @@ def train_grpo(
     train_answers,
     vllm: LLM,
 ):
+    date_str = time.strftime("%m%d-%H%M%S")
+    policy_type = "onpolicy" if train_config.epochs_per_rollout_batch == 1 else "offpolicy"
     wandb.init(
         entity=os.getenv("WANDB_ENTITY"),
-        project="cs336-alignment-grpo",
-        config={"train": asdict(train_config), "eval": asdict(eval_config)},
-        name=get_run_name("grpo", train_config),
+        project="cs336-grpo",
+        name=f"train_grpo_lr{train_config.learning_rate}_{train_config.loss_type}_{policy_type}_{date_str}",
+        config={
+            "n_grpo_steps": train_config.n_grpo_steps,
+            "grpo_rollout_batch_size": train_config.rollout_batch_size,
+            "grpo_group_size": train_config.group_size,
+            "grpo_epochs_per_rollout_batch": train_config.epochs_per_rollout_batch,
+            "grpo_policy_type": policy_type,
+            "grpo_use_std_normalization": train_config.use_std_normalization,
+            "grpo_loss_type": train_config.loss_type,
+            "grpo_train_batch_size": train_config.train_batch_size,
+            "grpo_micro_batch_size": train_config.micro_train_batch_size,
+        }
     )
     wandb.define_metric("train_step")
     wandb.define_metric("eval_step")
@@ -371,18 +404,20 @@ def train_grpo(
     )
 
     model = AutoModelForCausalLM.from_pretrained(
-        pretrained_model_name_or_path=train_config.model_name,
+        pretrained_model_name_or_path=train_config.local_model_path,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
         device_map="cpu",
     ).to(train_config.train_device)
     tokenizer = AutoTokenizer.from_pretrained(train_config.model_name)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate, betas=train_config.betas)
-    print(f"[ei train] Tokenizer {train_config.model_name} loaded")
-    print(f"[ei train] Model {train_config.model_name} loaded on {train_config.train_device}")
-    print("[ei train] Optimizer loaded")
+    optimizer = torch.optim.AdamW(model.parameters(), weight_decay=0.0,lr=train_config.learning_rate, betas=train_config.betas)
+    logging.info(f"[grpo train] Tokenizer {train_config.model_name} loaded from {train_config.local_model_path}")
+    logging.info(f"[grpo train] Model {train_config.model_name} loaded on device: {train_config.train_device},"
+                f" will eval on device:{train_config.eval_device}"
+                f" from {train_config.local_model_path}")
+    logging.info("[grpo train] Optimizer loaded")
 
-    # This will return the batch for micro-step which used for gradient accumulation
+    # This will return the batch data for grpo step
     base_ds = GRPODataset(train_prompts, train_cot, train_answers)
     base_dl = DataLoader(
         dataset=base_ds,
@@ -395,7 +430,8 @@ def train_grpo(
 
     global_step = 0
     for grpo_step in range(train_config.n_grpo_steps):
-        # (3): Sample a batch of questions from dataset
+        logging.info(f"[grpo train] start Grpo step_{grpo_step}")
+        # Sample a batch of questions from dataset
         sample_batch = next(cycled_dataloader)
         # sample_prompts, sample_cots, sample_answers = zip(*sample_batch)
         sample_prompts, sample_cots, sample_answers = sample_batch
@@ -403,16 +439,16 @@ def train_grpo(
         sample_cots = list(sample_cots)
         sample_answers = list(sample_answers)
 
-        print(f"Grpo step_{grpo_step} sample batch: {len(sample_prompts)}")
-        print(f", sample_prompts[0]: {sample_prompts[0]}")
-        print(f", sample_cots[0]: {sample_cots[0]}")
-        print(f", sample_answers[0]: {sample_answers[0]}")
+        logging.info(f"[grpo train] Grpo step_{grpo_step} sample batch: {len(sample_prompts)}"
+                    f", sample_prompts[0]: {sample_prompts[0]}, "
+                    f"sample_cots[0]: {sample_cots[0]}, "
+                    f"sample_answers[0]: {sample_answers[0]}")
 
         # (4): Set the old policy
         load_model_into_vllm_instance(model, vllm)
 
         # (5): Sample G outputs per question.
-        print(f"Generating {grpo_sampling_params.n} outputs...")
+        logging.info(f"Generating {train_config.group_size} outputs for each rollout samples {len(sample_prompts)}...")
         all_gens = vllm.generate(sample_prompts, grpo_sampling_params)
         all_prompts = []
         all_responses = []
@@ -423,7 +459,7 @@ def train_grpo(
                 all_responses.append(output.text)
                 all_answers.append(answer)
 
-        print("[grpo train] Generated output for question:")
+        logging.info(f"[grpo train] Generated output for question, total rollout data {len(all_prompts)}:")
         print_rich_dict({"prompt": all_prompts[0], "responses": all_responses[0], "answers": all_answers[0]})
 
         # (6) / (7): Compute rewards for each sampled output
@@ -451,33 +487,29 @@ def train_grpo(
         # Evaluate
         if (grpo_step + 1) % train_config.eval_steps == 0:
             load_model_into_vllm_instance(model, vllm)
-            prompts, cot, answers = load_and_format_prompts(eval_config.data_path, eval_config.prompt_path)
-            results = evaluate_vllm(
-                vllm_model=vllm,
-                reward_fn=r1_zero_reward_fn,
-                prompts=prompts,
-                answers=answers,
-                eval_sampling_params=eval_sp,
-            )
-            correct_cnt = results["correct"]
-            total = results["count"]
-            answer_wrong = results["answer_wrong"]
-            format_wrong = results["format_wrong"]
-            print(f"[Grpo eval] step_{grpo_step}, total_count:{total},"
-                 f" correct:{correct_cnt}, correct_rate:{correct_cnt}/{total},"
-                 f" answer_wrong:{answer_wrong}, answer_wrong_rate:{answer_wrong}/{total},"
-                 f" format_wrong:{format_wrong}, format_wrong_rate:{format_wrong}/{total}")
-            wandb.log(
-                {   
-                    "eval/correct": results["correct"],
-                    "eval/answer_wrong": results["answer_wrong"],
-                    "eval/format_wrong": results["format_wrong"],
-                    "eval/correct_rate": to_float(results["correct"]) / (results["count"]),
-                    "eval/format_wrong_rate": to_float(results["format_wrong"]) / (results["count"]),
-                    "eval/answer_wrong_rate": to_float(results["answer_wrong"]) / (results["count"]),
-                    "eval_step": grpo_step,
-                }
-            )
+            # prompts, cot, answers = load_and_format_prompts(eval_config.data_path, eval_config.prompt_path)
+            # results = evaluate_vllm(
+            #     vllm_model=vllm,
+            #     reward_fn=r1_zero_reward_fn,
+            #     prompts=prompts,
+            #     answers=answers,
+            #     eval_sampling_params=eval_sp,
+            # )
+            evaluate_sft_model(eval_config, vllm, eval_step=grpo_step)
+            
+            # wandb.log({
+            #     "eval/correct": results["correct"],
+            #     "eval/count": results["count"],
+            #     "eval/answer_wrong": results["answer_wrong"],
+            #     "eval/format_wrong": results["format_wrong"],
+            #     "eval/accuracy": results["accuracy"],
+            #     "eval/format_wrong_rate": results["format_wrong_rate"],
+            #     "eval/answer_wrong_rate": results["answer_wrong_rate"],
+            #     "eval/avg_response_length": results["avg_response_length"],
+            #     "eval/avg_correct_response_length": results["avg_correct_response_length"],
+            #     "eval/avg_incorrect_response_length": results["avg_incorrect_response_length"],
+            #     "eval_step": eval_step,}
+            # )
 
             save_model_and_tokenizer(model, tokenizer, train_config)
 
@@ -487,6 +519,15 @@ def train_grpo(
 
 def main(
     *,
+    n_grpo_steps: int,
+    rollout_batch_size: int,
+    group_size: int,
+    epochs_per_rollout_batch: int,
+    learning_rate: float,
+    use_std_normalization: bool,
+    loss_type: str,
+    train_batch_size:int ,
+    micro_batch_size: int,
     model_name: str = "Qwen/Qwen2.5-Math-1.5B",
     local_model_path: str = os.path.join(PROJECT_DIR, "models/Qwen2.5-Math-1.5B-Base"),
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train.jsonl"),
@@ -498,17 +539,42 @@ def main(
 ):
     dotenv.load_dotenv()
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["HF_HOME"] = "~/autodl_tmp/hf"
-    os.environ["TRANSFORMERS_CACHE"] = "~/autodl_tmp/hf/models"
-    os.environ["HF_HUB_CACHE"] = "~/autodl_tmp/hf/hub"
+    os.environ["HF_HOME"] = "~/autodl-tmp/hf"
+    os.environ["TRANSFORMERS_CACHE"] = "~/autodl-tmp/hf/models"
+    os.environ["HF_HUB_CACHE"] = "~/autodl-tmp/hf/hub"
 
     # Login Wandb
     api_key = os.getenv("WANDB_API_KEY")
     wandb.login(key=api_key)
+    logging.info(f"init wandb.login with api_key:{api_key}")
 
     train_config = TrainConfig()
     eval_config = EvaluateConfig()
-    print_rich_dict({"train config": asdict(train_config), "eval config": asdict(eval_config)})
+
+    # Set train config
+    train_config.n_grpo_steps = n_grpo_steps
+    train_config.rollout_batch_size = rollout_batch_size
+    train_config.group_size = group_size
+    train_config.n_prompts_per_rollout_batch = rollout_batch_size // group_size
+    train_config.epochs_per_rollout_batch = epochs_per_rollout_batch
+    assert train_config.train_batch_size >= train_config.group_size, "train_batch_size must be greater than or equal to group_size"
+    # TODO: 某些参数需要计算
+    train_config.use_std_normalization = use_std_normalization
+    train_config.learning_rate = learning_rate
+    train_config.loss_type = loss_type
+    train_config.train_batch_size = train_batch_size
+    train_config.micro_train_batch_size = micro_batch_size
+    train_config.gradient_accumulation_steps = train_config.train_batch_size // train_config.micro_train_batch_size
+    
+    train_config.n_microbatches_per_rollout_batch = train_config.rollout_batch_size // train_config.micro_train_batch_size
+
+    total_train_data_per_grpo_step = (
+        train_config.epochs_per_rollout_batch * train_config.rollout_batch_size
+    )
+    train_config.train_steps_per_rollout_batch = total_train_data_per_grpo_step // train_config.train_batch_size
+
+    print_rich_dict({"train config": asdict(train_config), 
+                    "eval config": asdict(eval_config)})
 
     vllm = init_vllm(model_id=local_model_path, device=train_config.eval_device, seed=seed)
     prompts, cot, answers = load_and_format_prompts(train_config.data_path, train_config.prompt_path)
@@ -527,9 +593,26 @@ def main(
 # 实验控制变量:
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--sample_questions_per_ei_step", type=int, default=512, help="sample_questions_per_ei_step")
-    parser.add_argument("--rollout_per_prompt", type=int, default=4, help="rollout_per_prompt")
-    parser.add_argument("--sft_train_steps", type=int, default=8, help="sft_train_steps")
+    parser.add_argument("--n_grpo_steps", type=int, default=200, help="n_grpo_steps")
+    parser.add_argument("--rollout_batch_size", type=int, default=256, help="total rollout samples per grpo step")
+    parser.add_argument("--group_size", type=int, default=8, help="each grpo step sample group_size output per question")
+    parser.add_argument("--epochs_per_rollout_batch", type=int, default=1, help="epochs_per_rollout_batch")
+    parser.add_argument("--use_std_normalization", type=bool, default=False, help="use_std_normalization")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="learning_rate")
+    # type:no_baseline,reinforce_with_baseline,grpo_clip
+    parser.add_argument("--loss_type", type=str, default="grpo_clip", help="loss_type in no_baseline,grpo_clip,reinforce_with_baseline")
+    parser.add_argument("--train_batch_size", type=int, default=256, help="train_batch_size")
+    parser.add_argument("--micro_batch_size", type=int, default=8, help="micro_batch_size")
+    
     args = parser.parse_args()
-
-    fire.Fire(main)
+    logging.info(f"start train grpo with params: {args}")
+    fire.Fire(main(n_grpo_steps=args.n_grpo_steps,
+                    rollout_batch_size=args.rollout_batch_size,
+                    group_size=args.group_size,
+                    epochs_per_rollout_batch=args.epochs_per_rollout_batch,
+                    learning_rate=args.learning_rate,
+                    use_std_normalization=args.use_std_normalization,
+                    loss_type=args.loss_type,
+                    train_batch_size=args.train_batch_size,
+                    micro_batch_size=args.micro_batch_size,
+                    ))
