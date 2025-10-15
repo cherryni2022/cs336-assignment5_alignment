@@ -134,6 +134,65 @@ class EvaluateConfig:
     include_stop_str_in_output: bool = True
     eval_result_dir: str = os.path.join(PROJECT_DIR, "evaluations/grpo")
 
+class AsyncEvaluator:
+    def __init__(self, eval_config: EvaluateConfig, vllm: LLM):
+        self.eval_config = eval_config
+        self.vllm = vllm
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eval")
+        self.current_eval_future: Optional[Future] = None
+        
+    def start_async_evaluation(self, model: torch.nn.Module, eval_step: int) -> Future:
+        """异步启动评估任务"""
+        # 等待上一个评估完成
+        if self.current_eval_future and not self.current_eval_future.done():
+            logging.warning(f"Previous evaluation still running, waiting...")
+            self.current_eval_future.result()  # 阻塞等待完成
+            
+        # 创建模型权重的深拷贝到CPU 即load_model_into_vllm_instance(model, vllm)
+        model.eval()
+        model.tie_weights()
+        cpu_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        model.train()
+        
+        # 提交异步评估任务
+        self.current_eval_future = self.executor.submit(
+            self._evaluate_async, cpu_state_dict, eval_step
+        )
+        return self.current_eval_future
+        
+    def _evaluate_async(self, cpu_state_dict: dict, eval_step: int):
+        """异步评估的实际执行函数"""
+        try:
+            logging.info(f"[async_eval] Starting evaluation for step {eval_step}")
+            
+            # 加载权重到vLLM实例
+            llm_model = self.vllm.llm_engine.model_executor.driver_worker.model_runner.model
+            llm_model.load_weights(cpu_state_dict.items())
+            torch.cuda.synchronize(torch.device("cuda:1"))
+            
+            # 执行评估
+            evaluate_sft_model(self.eval_config, self.vllm, eval_step=eval_step)
+            
+            logging.info(f"[async_eval] Evaluation completed for step {eval_step}")
+            
+        except Exception as e:
+            logging.error(f"[async_eval] Evaluation failed for step {eval_step}: {e}")
+            raise
+        finally:
+            # 清理CPU内存
+            del cpu_state_dict
+            torch.cuda.empty_cache()
+            
+    def wait_for_completion(self):
+        """等待当前评估完成"""
+        if self.current_eval_future:
+            self.current_eval_future.result()
+            
+    def shutdown(self):
+        """关闭异步评估器"""
+        self.wait_for_completion()
+        self.executor.shutdown(wait=True)
+
 #原train.jsonl 数据集+prompt_template =>(prompt,cot,true_answer)
 class GRPODataset(Dataset):
     def __init__(self, train_prompts, train_cot, train_answers):
@@ -430,6 +489,9 @@ def train_grpo(
     )
     cycled_dataloader = cycle_dataloader(base_dl)
 
+    # 创建异步评估器
+    async_evaluator = AsyncEvaluator(eval_config, vllm)
+
     global_step = 0
     for grpo_step in range(train_config.n_grpo_steps):
         logging.info(f"[grpo train] start Grpo step_{grpo_step}")
@@ -441,7 +503,7 @@ def train_grpo(
         sample_cots = list(sample_cots)
         sample_answers = list(sample_answers)
 
-        logging.info(f"[grpo train] Grpo step_{grpo_step} sample batch: {len(sample_prompts)}"
+        logging.info(f"[grpo train] Grpo step_{grpo_step+1} sample batch: {len(sample_prompts)}"
                     f", sample_prompts[0]: {sample_prompts[0]}, "
                     f"sample_cots[0]: {sample_cots[0]}, "
                     f"sample_answers[0]: {sample_answers[0]}")
@@ -493,35 +555,16 @@ def train_grpo(
             logging.info(f"[grpo eval] at step_{grpo_step+1} and save model start ==================")
             save_model_and_tokenizer(model, tokenizer, train_config, train_config.sub_experiment_name)
 
-            load_model_into_vllm_instance(model, vllm)
-            # prompts, cot, answers = load_and_format_prompts(eval_config.data_path, eval_config.prompt_path)
-            # results = evaluate_vllm(
-            #     vllm_model=vllm,
-            #     reward_fn=r1_zero_reward_fn,
-            #     prompts=prompts,
-            #     answers=answers,
-            #     eval_sampling_params=eval_sp,
-            # )
-            evaluate_sft_model(eval_config, vllm, eval_step=grpo_step)
-            logging.info(f"[eval] Evaluation completed for step_{sft_step}=====================")
-            # wandb.log({
-            #     "eval/correct": results["correct"],
-            #     "eval/count": results["count"],
-            #     "eval/answer_wrong": results["answer_wrong"],
-            #     "eval/format_wrong": results["format_wrong"],
-            #     "eval/accuracy": results["accuracy"],
-            #     "eval/format_wrong_rate": results["format_wrong_rate"],
-            #     "eval/answer_wrong_rate": results["answer_wrong_rate"],
-            #     "eval/avg_response_length": results["avg_response_length"],
-            #     "eval/avg_correct_response_length": results["avg_correct_response_length"],
-            #     "eval/avg_incorrect_response_length": results["avg_incorrect_response_length"],
-            #     "eval_step": eval_step,}
-            # )
+            # Run async evaluatoin
+            logging.info(f"[grpo async eval] at step_{grpo_step+1} start async evaluation==================")
+            eval_future = async_evaluator.start_async_evaluation(model, grpo_step+1)
+            # load_model_into_vllm_instance(model, vllm)
+            # evaluate_sft_model(eval_config, vllm, eval_step=sft_step)
+            logging.info(f"[grpo async eval] Evaluation completed for step_{grpo_step+1}=====================")
 
-            
-    print("Grpo Training Finished,saving model....")
-    save_model_and_tokenizer(model, tokenizer, train_config, train_config.sub_experiment_name)
-    
+        save_model_and_tokenizer(model, tokenizer, train_config, train_config.sub_experiment_name)
+
+    print("Grpo Training Finished")
 
 def main(
     *,
