@@ -42,7 +42,7 @@ logging.basicConfig(
 class TrainConfig:
     experiment_name_base: str = "experiments"
     experiment_name: str = "grpo-qwen2.5-math"
-    sub_experiment_name: str = "adj_lr"
+    sub_experiment_name: str = "grpo_learning_rate"
     model_name: str = "Qwen/Qwen2.5-Math-1.5B"
     local_model_path: str = os.path.join(PROJECT_DIR, "models/Qwen2.5-Math-1.5B-Base")
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train.jsonl")
@@ -446,8 +446,8 @@ def train_grpo(
                     f"sample_cots[0]: {sample_cots[0]}, "
                     f"sample_answers[0]: {sample_answers[0]}")
 
-        # (4): Set the old policy
-        load_model_into_vllm_instance(model, vllm)
+        # 每轮train policy 完成后 load model
+        #load_model_into_vllm_instance(model, vllm)
 
         # (5): Sample G outputs per question.
         logging.info(f"Generating {train_config.group_size} outputs for each rollout samples {len(sample_prompts)}...")
@@ -488,12 +488,13 @@ def train_grpo(
             grpo_step=grpo_step,
         )
 
+        # (4): Set the old policy 为下一个grpo step rollout数据做准备
+        load_model_into_vllm_instance(model, vllm)
+
         # Evaluate
         if (grpo_step + 1) % train_config.eval_steps == 0:
             logging.info(f"[grpo eval] at step_{grpo_step+1} and save model start ==================")
             save_model_and_tokenizer(model, tokenizer, train_config, train_config.sub_experiment_name)
-
-            load_model_into_vllm_instance(model, vllm)
             # prompts, cot, answers = load_and_format_prompts(eval_config.data_path, eval_config.prompt_path)
             # results = evaluate_vllm(
             #     vllm_model=vllm,
@@ -559,6 +560,7 @@ def main(
     eval_config = EvaluateConfig()
 
     # Set train config
+    train_config.sub_experiment_name = sub_experiment_name
     train_config.n_grpo_steps = n_grpo_steps
     train_config.rollout_batch_size = rollout_batch_size
     train_config.group_size = group_size

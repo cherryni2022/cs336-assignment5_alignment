@@ -208,7 +208,7 @@ def evaluate_vllm(vllm_model: LLM,
     prompts: List[str],
     answers: List[str],
     eval_sampling_params: SamplingParams,):
-    logging.info(f"[eval] Evaluating {len(prompts)} samples.")
+    logging.info(f"[evaluate_vllm] Evaluating {len(prompts)} samples.")
     responses = get_vllm_response(vllm_model, prompts, eval_sampling_params)
     total = len(prompts)
     total_reward = 0

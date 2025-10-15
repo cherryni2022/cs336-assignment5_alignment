@@ -3,6 +3,7 @@ import os
 from dataclasses import asdict, dataclass
 from contextlib import nullcontext
 from typing import Callable, List
+from concurrent.futures import ThreadPoolExecutor, Future
 import dotenv
 import fire
 import time
@@ -42,7 +43,7 @@ logging.basicConfig(
 class TrainConfig:
     experiment_name_base: str = "experiments"
     experiment_name: str = "grpo-qwen2.5-math"
-    sub_experiment_name: str = "adj_lr"
+    sub_experiment_name: str = "grpo_learning_rate"
     model_name: str = "Qwen/Qwen2.5-Math-1.5B"
     local_model_path: str = os.path.join(PROJECT_DIR, "models/Qwen2.5-Math-1.5B-Base")
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train.jsonl")
@@ -163,7 +164,7 @@ class AsyncEvaluator:
     def _evaluate_async(self, cpu_state_dict: dict, eval_step: int):
         """异步评估的实际执行函数"""
         try:
-            logging.info(f"[async_eval] Starting evaluation for step {eval_step}")
+            logging.info(f"[async_eval] Starting evaluation for step_{eval_step}")
             
             # 加载权重到vLLM实例
             llm_model = self.vllm.llm_engine.model_executor.driver_worker.model_runner.model
@@ -173,10 +174,10 @@ class AsyncEvaluator:
             # 执行评估
             evaluate_sft_model(self.eval_config, self.vllm, eval_step=eval_step)
             
-            logging.info(f"[async_eval] Evaluation completed for step {eval_step}")
+            logging.info(f"[async_eval] Evaluation completed for step_{eval_step}")
             
         except Exception as e:
-            logging.error(f"[async_eval] Evaluation failed for step {eval_step}: {e}")
+            logging.error(f"[async_eval] Evaluation failed for step_{eval_step}: {e}")
             raise
         finally:
             # 清理CPU内存
@@ -387,7 +388,7 @@ def update_policy(
                 optimizer.zero_grad()
 
                 logging.info(
-                    f"[train grpo] Step result summary at grpo step_{grpo_step}, global train_step_{global_step_ + 1}: "
+                    f"[train grpo] Step result summary at grpo step_{grpo_step+1}, global train_step_{global_step_ + 1}: "
                     f" | accumulate_batch_loss: {batch_loss:.4f}"
                     f" | avg_loss: {batch_loss / train_config.gradient_accumulation_steps:.4f}"
                     f" | avg_response_entropy: {accumulated_token_entropy / train_config.gradient_accumulation_steps:.4f}"
@@ -494,7 +495,7 @@ def train_grpo(
 
     global_step = 0
     for grpo_step in range(train_config.n_grpo_steps):
-        logging.info(f"[grpo train] start Grpo step_{grpo_step}")
+        logging.info(f"[grpo train] start Grpo step_{grpo_step+1}")
         # Sample a batch of questions from dataset
         sample_batch = next(cycled_dataloader)
         # sample_prompts, sample_cots, sample_answers = zip(*sample_batch)
@@ -508,11 +509,12 @@ def train_grpo(
                     f"sample_cots[0]: {sample_cots[0]}, "
                     f"sample_answers[0]: {sample_answers[0]}")
 
-        # (4): Set the old policy
-        load_model_into_vllm_instance(model, vllm)
+        # eval_steps vllm还在进行evaluate, 最新的model已经load到vllm, 不需要再load
+        if grpo_step % train_config.eval_steps != 0:
+            load_model_into_vllm_instance(model, vllm)
 
         # (5): Sample G outputs per question.
-        logging.info(f"Generating {train_config.group_size} outputs for each rollout samples {len(sample_prompts)}...")
+        logging.info(f"[grpo train] Grpo step_{grpo_step+1} Generating {train_config.group_size} outputs for each rollout samples {len(sample_prompts)}...")
         all_gens = vllm.generate(sample_prompts, grpo_sampling_params)
         all_prompts = []
         all_responses = []
@@ -602,6 +604,7 @@ def main(
     eval_config = EvaluateConfig()
 
     # Set train config
+    train_config.sub_experiment_name = sub_experiment_name
     train_config.n_grpo_steps = n_grpo_steps
     train_config.rollout_batch_size = rollout_batch_size
     train_config.group_size = group_size
