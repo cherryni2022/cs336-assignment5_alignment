@@ -104,36 +104,36 @@ def compute_policy_gradient_loss(
         return loss, metadata
     
     # GRPO-Clip
-    assert advantages is not None, "advantages must be provided for grpo_clip"
-    assert old_log_probs is not None, "old_log_probs must be provided for grpo_clip"
-    assert cliprange is not None, "cliprange must be provided for grpo_clip"
-    assert advantages.shape == (B, 1), f"advantages must have shape (B, 1); got {tuple(advantages.shape)}"
-    assert old_log_probs.shape == (B, T), (
-        f"old_log_probs must have shape (B, T); got {tuple(old_log_probs.shape)}"
-    )
-    assert cliprange >= 0.0, "cliprange should be non-negative"
+    if loss_type == "grpo_clip":
+        assert advantages is not None, "advantages must be provided for grpo_clip"
+        assert old_log_probs is not None, "old_log_probs must be provided for grpo_clip"
+        assert cliprange is not None, "cliprange must be provided for grpo_clip"
+        assert advantages.shape == (B, 1), f"advantages must have shape (B, 1); got {tuple(advantages.shape)}"
+        assert old_log_probs.shape == (B, T), (
+            f"old_log_probs must have shape (B, T); got {tuple(old_log_probs.shape)}"
+        )
+        assert cliprange >= 0.0, "cliprange should be non-negative"
 
-    loss, meta = compute_grpo_clip_loss(
-        advantages=advantages,
-        policy_log_probs=policy_log_probs,
-        old_log_probs=old_log_probs,
-        cliprange=float(cliprange),
-    )
+        loss, meta = compute_grpo_clip_loss(
+            advantages=advantages,
+            policy_log_probs=policy_log_probs,
+            old_log_probs=old_log_probs,
+            cliprange=float(cliprange),
+        )
+        #Add clip fraction statistic (fraction of tokens where clipping was active)
+        # ratio = torch.exp(policy_log_probs - old_log_probs)
+        # clipped_ratio = torch.clamp(ratio, 1 - float(cliprange), 1 + float(cliprange))
+        # was_clipped = (clipped_ratio != ratio).to(policy_log_probs.dtype)
+        # clip_fraction = masked_mean(was_clipped, torch.ones_like(policy_log_probs))
 
-    # Add clip fraction statistic (fraction of tokens where clipping was active)
-    ratio = torch.exp(policy_log_probs - old_log_probs)
-    clipped_ratio = torch.clamp(ratio, 1 - float(cliprange), 1 + float(cliprange))
-    was_clipped = (clipped_ratio != ratio).to(policy_log_probs.dtype)
-    clip_fraction = masked_mean(was_clipped, torch.ones_like(policy_log_probs))
-
-    meta_out = dict(meta)
-    meta_out.update(
-        {
-            "mean_advantage": advantages.mean(),
-            "clip_fraction": clip_fraction,
-        }
-    )
-    return loss, meta_out
+        # meta_out = dict(meta)
+        # meta_out.update(
+        #     {
+        #         "mean_advantage": advantages.mean(),
+        #         "clip_fraction": clip_fraction,
+        #     }
+        # )
+        return loss, meta
 
 def masked_mean(
     tensor: torch.Tensor,
@@ -141,7 +141,7 @@ def masked_mean(
     dim: int | None = None
 ) -> torch.Tensor:
     masked_tensor = torch.where(mask, tensor, torch.zeros_like(tensor))
-    return torch.sum(masked_tensor, dim=dim) / torch.sum(mask, dim=dim)    # 进行了长度归一化, 为per token的loss
+    return torch.sum(masked_tensor, dim=dim) / torch.sum(mask, dim=dim)
 
 
 def grpo_microbatch_train_step(
@@ -160,7 +160,7 @@ def grpo_microbatch_train_step(
     loss.backward()
     return loss, metadata
 
-def grpo_microbatch_train_step_seq_level_loss(
+def grpo_microbatch_train_step_normalize(
         policy_log_probs: torch.Tensor,
         response_mask: torch.Tensor,
         gradient_accumulation_steps: int,

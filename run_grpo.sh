@@ -18,5 +18,6 @@ sub_experiment="adj_lr"
 
 # 训练 grpo 模型
 # 1. 基于作业给的参数, 比较不同learning_rate的效果
+echo "python cs336_alignment/my_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type"
 python cs336_alignment/my_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type
 #python cs336_alignment/my_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type > grpo_lr_${learning_rate}_${current_time}.log 2>&1

@@ -315,11 +315,9 @@ def update_policy(
                     cliprange=0.2,
                 )
 
-                #mean_advantage = metadata["mean_advantage"]
-                #clip_fraction = metadata["clip_fraction"]
                 avg_token_entropy = masked_mean(entropy, response_mask_micro, dim=None)
                 accumulated_token_entropy += avg_token_entropy.item()
-                accumulated_clip_fraction += masked_mean(metadata["clip_fraction"], response_mask_micro, dim=None).item()
+                accumulated_clip_fraction += masked_mean(metadata["cliped"], response_mask_micro, dim=None).item()
                 batch_loss += loss.item()
 
             if train_microstep == train_config.gradient_accumulation_steps - 1:
