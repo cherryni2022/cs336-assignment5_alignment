@@ -265,6 +265,7 @@ class GRPORolloutDataset(Dataset):
         self, model, prompts, responses, raw_rewards, advantages, train_config: TrainConfig, tokenizer
     ):
         print_color("Generate Rollout Dataset...")
+        logging.info("Generate Rollout Dataset...")
         self.raw_rewards = raw_rewards
         self.advantages = advantages
 
@@ -281,6 +282,7 @@ class GRPORolloutDataset(Dataset):
         # We need calculate the old log probs using old model,
         self.old_log_probs, self.token_entropy = get_old_log_probs(model, input_ids, labels, train_config)
         print_color("Generate Rollout Dataset Done.")
+        logging.info("Generate Rollout Dataset Done.")
 
     def __len__(self):
         return len(self.input_ids)
