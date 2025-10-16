@@ -447,7 +447,7 @@ def train_grpo(
                     f"sample_answers[0]: {sample_answers[0]}")
 
         # 每轮train policy 完成后 load model
-        #load_model_into_vllm_instance(model, vllm)
+        #load_model_into_vllm_instance(model, vllm, train_config.eval_device)
 
         # (5): Sample G outputs per question.
         logging.info(f"Generating {train_config.group_size} outputs for each rollout samples {len(sample_prompts)}...")
@@ -489,7 +489,7 @@ def train_grpo(
         )
 
         # (4): Set the old policy 为下一个grpo step rollout数据做准备
-        load_model_into_vllm_instance(model, vllm)
+        load_model_into_vllm_instance(model, vllm, train_config.eval_device)
 
         # Evaluate
         if (grpo_step + 1) % train_config.eval_steps == 0:

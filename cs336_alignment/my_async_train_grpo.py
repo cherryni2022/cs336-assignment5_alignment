@@ -513,7 +513,7 @@ def train_grpo(
 
         # eval_steps vllm还在进行evaluate, 最新的model已经load到vllm, 不需要再load
         if grpo_step % train_config.eval_steps != 0:
-            load_model_into_vllm_instance(model, vllm)
+            load_model_into_vllm_instance(model, vllm, train_config.eval_device)
 
         # (5): Sample G outputs per question.
         logging.info(f"[grpo train] Grpo step_{grpo_step+1} Generating {train_config.group_size} outputs for each rollout samples {len(sample_prompts)}...")
