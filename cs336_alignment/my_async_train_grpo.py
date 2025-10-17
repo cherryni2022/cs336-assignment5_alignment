@@ -12,6 +12,7 @@ import torch.nn as nn
 import wandb
 from argparse import ArgumentParser
 from torch.utils.data import DataLoader, Dataset
+import multiprocessing as mp
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 import gc
@@ -48,7 +49,7 @@ class TrainConfig:
     local_model_path: str = os.path.join(PROJECT_DIR, "models/Qwen2.5-Math-1.5B-Base")
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train.jsonl")
     prompt_path: str = os.path.join(PROJECT_DIR, "cs336_alignment/prompts/r1_zero.prompt")
-
+    vllm_seed: int = 43
 
     # assignment 试验给出的参数 ------------------
     
@@ -86,8 +87,8 @@ class TrainConfig:
 
     eval_steps: int = 2
     
+    rollout_device: str = "cuda:1"
     eval_device: str = "cuda:1"
-    #eval_device: str = "cuda:1"
     train_device: str = "cuda:0"
 
     # For VLLM sampling
@@ -194,6 +195,47 @@ class AsyncEvaluator:
         self.wait_for_completion()
         self.executor.shutdown(wait=True)
 
+def _load_weights_from_state_dict(llm, cpu_state_dict: dict, device: str):
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    llm_model.load_weights(cpu_state_dict.items())
+    torch.cuda.synchronize(torch.device(device))
+
+def save_model_state_dict(model: AutoModelForCausalLM):
+    #手动保存到cpu state_dict
+    model.eval()
+    model.tie_weights()
+    cpu_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    model.train()
+    return cpu_state_dict
+
+# async evaluate
+def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue, local_model_path: str, device: str, seed: int, gpu_mem_util: float,
+                eval_cfg: EvaluateConfig):
+    logging.basicConfig(format="%(asctime)s - eval - %(levelname)s - %(message)s", level=logging.INFO)
+    llm = init_vllm(model_id=local_model_path, device=device, seed=seed, gpu_memory_utilization=gpu_mem_util)
+    logging.info(f"[eval-worker] vLLM initialized on {device} with mem_util={gpu_mem_util}")
+
+    while True:
+        cmd = cmd_q.get()
+        if cmd is None:
+            continue
+        ctype = cmd.get("type")
+        if ctype == "shutdown":
+            logging.info("[eval-worker] shutdown received")
+            break
+        elif ctype == "update_weights":
+            cpu_sd = cmd.get("state_dict")
+            _load_weights_from_state_dict(llm, cpu_sd, device)
+            res_q.put({"type": "ack", "op": "update_weights"})
+        elif ctype == "evaluate":
+            step: int = cmd.get("step", 0)
+            logging.info(f"[eval-worker] evaluate received step={step}")
+            evaluate_sft_model(eval_cfg, llm, eval_step=step)
+            logging.info(f"[eval-worker] evaluation completed for step_{step}=====================")
+            res_q.put({"type": "evaluate_result", "results": results})
+        else:
+            logging.warning(f"[eval-worker] unknown cmd: {ctype}")
+
 #原train.jsonl 数据集+prompt_template =>(prompt,cot,true_answer)
 class GRPODataset(Dataset):
     def __init__(self, train_prompts, train_cot, train_answers):
@@ -282,7 +324,12 @@ class GRPORolloutDataset(Dataset):
         # We need calculate the old log probs using old model,
         self.old_log_probs, self.token_entropy = get_old_log_probs(model, input_ids, labels, train_config)
         print_color("Generate Rollout Dataset Done.")
-        logging.info("Generate Rollout Dataset Done.")
+        logging.info(f"Generate Rollout Dataset Done, "
+                    f"input_ids.shape={len(self.input_ids)},"
+                    f"labels.shape={len(self.labels)},"
+                    f"response_mask.shape={len(self.response_mask)},"
+                    f"old_log_probs.shape={len(self.old_log_probs)},"
+                    f"token_entropy.shape={len(self.token_entropy)}")
 
     def __len__(self):
         return len(self.input_ids)
@@ -493,7 +540,31 @@ def train_grpo(
     cycled_dataloader = cycle_dataloader(base_dl)
 
     # 创建异步评估器
-    async_evaluator = AsyncEvaluator(eval_config, vllm)
+    # async_evaluator = AsyncEvaluator(eval_config, vllm)
+
+    # 深拷贝model权重到CPU，避免持有GPU张量
+    cpu_state_dict = save_model_state_dict(model)
+
+    # 启动子进程vllm for evaluate（device cuda:1）
+    # rollout_cmd_q: mp.Queue = mp.Queue()
+    # rollout_res_q: mp.Queue = mp.Queue()
+    eval_cmd_q: mp.Queue = mp.Queue()
+    eval_res_q: mp.Queue = mp.Queue()
+
+    eval_p = mp.Process(
+        target=eval_worker,
+        args=(eval_cmd_q, eval_res_q, train_config.local_model_path, 
+              train_config.eval_device, train_config.vllm_seed,
+              train_config.eval_gpu_mem_util, eval_config),
+        daemon=True,
+    )
+    eval_p.start()
+    logging.info(f"[grpo train] evaluate worker started on {train_config.eval_device} with process isolation")
+    # 初次加载训练权重到vLLM(evaluate)实例
+    eval_cmd_q.put({"type": "update_weights", "state_dict": cpu_state_dict})
+    # 等待权重加载完成的确认
+    _ = eval_res_q.get()
+    logging.info("[grpo train] weights loaded into vLLM(evaluate) instance")
 
     global_step = 0
     for grpo_step in range(train_config.n_grpo_steps):
@@ -511,9 +582,8 @@ def train_grpo(
                     f"sample_cots[0]: {sample_cots[0]}, "
                     f"sample_answers[0]: {sample_answers[0]}")
 
-        # eval_steps vllm还在进行evaluate, 最新的model已经load到vllm, 不需要再load
-        if grpo_step % train_config.eval_steps != 0:
-            load_model_into_vllm_instance(model, vllm, train_config.eval_device)
+        # load model params from cpu_state_dict to vllm(rollout) instance
+        _load_weights_from_state_dict(vllm, cpu_state_dict, train_config.rollout_device)
 
         # (5): Sample G outputs per question.
         logging.info(f"[grpo train] Grpo step_{grpo_step+1} Generating {train_config.group_size} outputs for each rollout samples {len(sample_prompts)}...")
@@ -540,7 +610,6 @@ def train_grpo(
             normalized_by_std=train_config.use_std_normalization,
         )
 
-
         global_step = update_policy(
             model=model,
             optimizer=optimizer,
@@ -554,20 +623,23 @@ def train_grpo(
             grpo_step=grpo_step,
         )
 
+        # (8): Save model params to cpu_state_dict
+        cpu_state_dict = save_model_state_dict(model)
+        logging.info(f"[grpo train] Grpo step_{grpo_step+1} save model state dict to cpu_state_dict....")
         # Evaluate
         if (grpo_step + 1) % train_config.eval_steps == 0:
-            logging.info(f"[grpo eval] at step_{grpo_step+1} and save model start ==================")
+            # save model&tokenizer every eval_step
             save_model_and_tokenizer(model, tokenizer, train_config, train_config.sub_experiment_name)
+            #logging.info(f"[grpo async eval] step_{grpo_step+1}: evaluate update_weights....")
+            eval_cmd_q.put({"type": "update_weights", "state_dict": cpu_state_dict})
+            _ = eval_res_q.get()
+            logging.info(f"[grpo async eval] step_{grpo_step+1}: evaluate update_weights finished....")
 
-            # Run async evaluatoin
-            logging.info(f"[grpo async eval] at step_{grpo_step+1} start async evaluation==================")
-            eval_future = async_evaluator.start_async_evaluation(model, grpo_step+1)
-            # load_model_into_vllm_instance(model, vllm)
-            # evaluate_sft_model(eval_config, vllm, eval_step=sft_step)
-            logging.info(f"[grpo async eval] Evaluation completed for step_{grpo_step+1}=====================")
+            logging.info(f"[grpo async eval] step_{grpo_step+1}: dispatch evaluation")
+            eval_cmd_q.put({"type": "evaluate", "step": grpo_step+1})
 
-        save_model_and_tokenizer(model, tokenizer, train_config, train_config.sub_experiment_name)
-
+      
+    save_model_and_tokenizer(model, tokenizer, train_config, train_config.sub_experiment_name)
     print("Grpo Training Finished")
 
 def main(
@@ -613,7 +685,7 @@ def main(
     train_config.n_prompts_per_rollout_batch = rollout_batch_size // group_size
     train_config.epochs_per_rollout_batch = epochs_per_rollout_batch
     assert train_config.train_batch_size >= train_config.group_size, "train_batch_size must be greater than or equal to group_size"
-    # TODO: 某些参数需要计算
+
     train_config.use_std_normalization = use_std_normalization
     train_config.learning_rate = learning_rate
     train_config.loss_type = loss_type
@@ -631,7 +703,7 @@ def main(
     print_rich_dict({"train config": asdict(train_config), 
                     "eval config": asdict(eval_config)})
 
-    vllm = init_vllm(model_id=local_model_path, device=train_config.eval_device, seed=seed)
+    vllm = init_vllm(model_id=local_model_path, device=train_config.rollout_device, seed=seed)
     prompts, cot, answers = load_and_format_prompts(train_config.data_path, train_config.prompt_path)
 
     train_grpo(
