@@ -236,11 +236,12 @@ def evaluate_vllm(vllm_model: LLM,
         }
         allinfo_dict_list.append(info_dict)
 
-        response_length += len(response.split())
+        response_length += len(response)
         if reward_dict["reward"] == 1:
-            correct_response_length += len(response.split())
+            #correct_response_length += len(response.split())
+            correct_response_length += len(response)
         else:
-            incorrect_response_length += len(response.split())
+            incorrect_response_length += len(response)
         
         if log_samples > 0:
             logging.info(f"[eval] sample prompt: {prompt}"

@@ -49,10 +49,8 @@ class TrainConfig:
     local_model_path: str = os.path.join(PROJECT_DIR, "models/Qwen2.5-Math-1.5B-Base")
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train.jsonl")
     prompt_path: str = os.path.join(PROJECT_DIR, "cs336_alignment/prompts/r1_zero.prompt")
-    vllm_seed: int = 43
 
     # assignment 试验给出的参数 ------------------
-    
     #group_size: int = 8
     #epochs_per_rollout_batch: int = 1 # On-policy
     
@@ -78,6 +76,7 @@ class TrainConfig:
 
     advantage_eps: float = 1e-6
     use_std_normalization: bool = True
+    masked_mean_or_normalize: str = "masked_mean" # masked_mean/masked_normalize
     # type:no_baseline,reinforce_with_baseline,grpo_clip
     loss_type: str = "reinforce_with_baseline"
     mixed_precision_training: bool = True
@@ -90,6 +89,8 @@ class TrainConfig:
     rollout_device: str = "cuda:1"
     eval_device: str = "cuda:1"
     train_device: str = "cuda:0"
+    rollout_gpu_mem_util: float = 0.45
+    eval_gpu_mem_util: float = 0.45
 
     # For VLLM sampling
     temperature: float = 1.0
@@ -99,6 +100,7 @@ class TrainConfig:
     include_stop_str_in_output: bool = True
     min_tokens: int = 4
     vllm_seed: int = 42
+    #vllm_seed: int = 43
 
     def __post_init__(self):
         assert self.train_batch_size % self.micro_train_batch_size == 0, "train_batch_size must be divisible by micro_train_batch_size"
@@ -209,11 +211,51 @@ def save_model_state_dict(model: AutoModelForCausalLM):
     return cpu_state_dict
 
 # async evaluate
-def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue, local_model_path: str, device: str, seed: int, gpu_mem_util: float,
-                eval_cfg: EvaluateConfig):
+def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue, 
+                eval_cfg: EvaluateConfig, 
+                train_config: TrainConfig, 
+                group_name: str):
     logging.basicConfig(format="%(asctime)s - eval - %(levelname)s - %(message)s", level=logging.INFO)
-    llm = init_vllm(model_id=local_model_path, device=device, seed=seed, gpu_memory_utilization=gpu_mem_util)
-    logging.info(f"[eval-worker] vLLM initialized on {device} with mem_util={gpu_mem_util}")
+    # Initialize wandb for the eval subprocess to enable wandb.log inside evaluate_sft_model
+    try:
+        api_key = os.getenv("WANDB_API_KEY")
+        if api_key:
+            wandb.login(key=api_key)
+            logging.info("[eval-worker] wandb.login succeeded via WANDB_API_KEY")
+        date_str = time.strftime("%m%d-%H%M%S")
+        wandb.init(
+            entity=wandb_entity,
+            project="cs336-grpo",
+            group=group_name,
+            job_type="eval",
+            name=f"train_grpo_lr{train_config.learning_rate}_{train_config.loss_type}_{policy_type}_{date_str}",
+            config={
+                "n_grpo_steps": train_config.n_grpo_steps,
+                "grpo_learning_rate": train_config.learning_rate,
+                "grpo_rollout_batch_size": train_config.rollout_batch_size,
+                "grpo_group_size": train_config.group_size,
+                "grpo_epochs_per_rollout_batch": train_config.epochs_per_rollout_batch,
+                "grpo_policy_type": policy_type,
+                "grpo_use_std_normalization": train_config.use_std_normalization,
+                "grpo_loss_type": train_config.loss_type,
+                "grpo_train_batch_size": train_config.train_batch_size,
+                "grpo_micro_batch_size": train_config.micro_train_batch_size,
+                "grpo_masked_mean_or_normalize": train_config.masked_mean_or_normalize,
+            },
+            tags=[train_config.experiment_name, train_config.sub_experiment_name,
+                    train_config.loss_type, policy_type, f"lr_{train_config.learning_rate}", 
+                    train_config.masked_mean_or_normalize],
+        )
+        wandb.define_metric("eval_step")
+        wandb.define_metric("eval/*", step_metric="eval_step")
+        logging.info("[eval-worker] wandb initialized for evaluation logging")
+    except Exception as e:
+        logging.warning(f"[eval-worker] wandb init failed: {e}. Proceeding without wandb.")
+    llm = init_vllm(model_id=train_config.local_model_path, 
+                    device=train_config.eval_device, 
+                    seed=train_config.vllm_seed, 
+                    gpu_memory_utilization=train_config.eval_gpu_mem_util)
+    logging.info(f"[eval-worker] vLLM initialized on {train_config.eval_device} with mem_util={train_config.eval_gpu_mem_util}")
 
     while True:
         cmd = cmd_q.get()
@@ -222,6 +264,10 @@ def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue, local_model_path: str, device:
         ctype = cmd.get("type")
         if ctype == "shutdown":
             logging.info("[eval-worker] shutdown received")
+            try:
+                wandb.finish()
+            except Exception:
+                pass
             break
         elif ctype == "update_weights":
             cpu_sd = cmd.get("state_dict")
@@ -230,9 +276,12 @@ def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue, local_model_path: str, device:
         elif ctype == "evaluate":
             step: int = cmd.get("step", 0)
             logging.info(f"[eval-worker] evaluate received step={step}")
-            evaluate_sft_model(eval_cfg, llm, eval_step=step)
+            try:
+                evaluate_sft_model(eval_cfg, llm, eval_step=step)
+            except Exception as e:
+                logging.exception(f"[eval-worker] evaluation failed at step {step}: {e}")
             logging.info(f"[eval-worker] evaluation completed for step_{step}=====================")
-            res_q.put({"type": "evaluate_result", "results": results})
+            res_q.put({"type": "evaluate_result", "step": step})
         else:
             logging.warning(f"[eval-worker] unknown cmd: {ctype}")
 
@@ -306,8 +355,7 @@ class GRPORolloutDataset(Dataset):
     def __init__(
         self, model, prompts, responses, raw_rewards, advantages, train_config: TrainConfig, tokenizer
     ):
-        print_color("Generate Rollout Dataset...")
-        logging.info("Generate Rollout Dataset...")
+        logging.info("[GRPORolloutDataset] init and generate GRPORolloutDataset...")
         self.raw_rewards = raw_rewards
         self.advantages = advantages
 
@@ -323,13 +371,12 @@ class GRPORolloutDataset(Dataset):
 
         # We need calculate the old log probs using old model,
         self.old_log_probs, self.token_entropy = get_old_log_probs(model, input_ids, labels, train_config)
-        print_color("Generate Rollout Dataset Done.")
-        logging.info(f"Generate Rollout Dataset Done, "
-                    f"input_ids.shape={len(self.input_ids)},"
-                    f"labels.shape={len(self.labels)},"
-                    f"response_mask.shape={len(self.response_mask)},"
-                    f"old_log_probs.shape={len(self.old_log_probs)},"
-                    f"token_entropy.shape={len(self.token_entropy)}")
+        logging.info(f"[GRPORolloutDataset] generate Rollout Dataset Done, "
+                    f"input_ids.len={len(self.input_ids)},"
+                    f"labels.len={len(self.labels)},"
+                    f"response_mask.len={len(self.response_mask)},"
+                    f"old_log_probs.len={len(self.old_log_probs)},"
+                    f"token_entropy.len={len(self.token_entropy)}")
 
     def __len__(self):
         return len(self.input_ids)
@@ -470,13 +517,17 @@ def train_grpo(
     train_prompts,
     train_cot,
     train_answers,
-    vllm: LLM,
+    rollout_vllm: LLM,
 ):
     date_str = time.strftime("%m%d-%H%M%S")
-    policy_type = "onpolicy" if train_config.epochs_per_rollout_batch == 1 else "offpolicy"
+    wandb_entity = os.getenv("WANDB_ENTITY")
+    policy_type = "on_policy" if train_config.epochs_per_rollout_batch == 1 else "off_policy"
+    group_name = f"{train_config.experiment_name}-{train_config.sub_experiment_name}"
     wandb.init(
-        entity=os.getenv("WANDB_ENTITY"),
+        entity=wandb_entity,
         project="cs336-grpo",
+        group=group_name,
+        job_type="train",
         name=f"train_grpo_lr{train_config.learning_rate}_{train_config.loss_type}_{policy_type}_{date_str}",
         config={
             "n_grpo_steps": train_config.n_grpo_steps,
@@ -489,7 +540,11 @@ def train_grpo(
             "grpo_loss_type": train_config.loss_type,
             "grpo_train_batch_size": train_config.train_batch_size,
             "grpo_micro_batch_size": train_config.micro_train_batch_size,
-        }
+            "grpo_masked_mean_or_normalize": train_config.masked_mean_or_normalize,
+        },
+        tags=[train_config.experiment_name, train_config.sub_experiment_name,
+                train_config.loss_type, policy_type, f"lr_{train_config.learning_rate}", 
+                train_config.masked_mean_or_normalize],
     )
     wandb.define_metric("train_step")
     wandb.define_metric("eval_step")
@@ -505,13 +560,6 @@ def train_grpo(
         include_stop_str_in_output=train_config.include_stop_str_in_output,
         n=train_config.group_size,
         seed=train_config.vllm_seed,
-    )
-    eval_sp = SamplingParams(
-        temperature=eval_config.temperature,
-        top_p=eval_config.top_p,
-        max_tokens=eval_config.max_tokens,
-        stop=eval_config.stop_tokens,
-        include_stop_str_in_output=eval_config.include_stop_str_in_output,
     )
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -553,22 +601,21 @@ def train_grpo(
 
     eval_p = mp.Process(
         target=eval_worker,
-        args=(eval_cmd_q, eval_res_q, train_config.local_model_path, 
-              train_config.eval_device, train_config.vllm_seed,
-              train_config.eval_gpu_mem_util, eval_config),
+        args=(eval_cmd_q, eval_res_q,  
+              eval_config, train_config, group_name),
         daemon=True,
     )
     eval_p.start()
-    logging.info(f"[grpo train] evaluate worker started on {train_config.eval_device} with process isolation")
+    logging.info(f"[grpo main] evaluate worker started on {train_config.eval_device} with process isolation")
     # 初次加载训练权重到vLLM(evaluate)实例
     eval_cmd_q.put({"type": "update_weights", "state_dict": cpu_state_dict})
     # 等待权重加载完成的确认
     _ = eval_res_q.get()
-    logging.info("[grpo train] weights loaded into vLLM(evaluate) instance")
+    logging.info("[grpo main] weights loaded into vLLM(evaluate) instance")
 
     global_step = 0
     for grpo_step in range(train_config.n_grpo_steps):
-        logging.info(f"[grpo train] start Grpo step_{grpo_step+1}")
+        logging.info(f"[grpo train] start grpo step_{grpo_step+1}")
         # Sample a batch of questions from dataset
         sample_batch = next(cycled_dataloader)
         # sample_prompts, sample_cots, sample_answers = zip(*sample_batch)
@@ -577,7 +624,7 @@ def train_grpo(
         sample_cots = list(sample_cots)
         sample_answers = list(sample_answers)
 
-        logging.info(f"[grpo train] Grpo step_{grpo_step+1} sample batch: {len(sample_prompts)}"
+        logging.info(f"[grpo train] grpo step_{grpo_step+1} sample batch: {len(sample_prompts)}"
                     f", sample_prompts[0]: {sample_prompts[0]}, "
                     f"sample_cots[0]: {sample_cots[0]}, "
                     f"sample_answers[0]: {sample_answers[0]}")
@@ -586,8 +633,8 @@ def train_grpo(
         _load_weights_from_state_dict(vllm, cpu_state_dict, train_config.rollout_device)
 
         # (5): Sample G outputs per question.
-        logging.info(f"[grpo train] Grpo step_{grpo_step+1} Generating {train_config.group_size} outputs for each rollout samples {len(sample_prompts)}...")
-        all_gens = vllm.generate(sample_prompts, grpo_sampling_params)
+        #logging.info(f"[grpo train] grpo step_{grpo_step+1} Generating {train_config.group_size} outputs for each rollout samples {len(sample_prompts)}...")
+        all_gens = rollout_vllm.generate(sample_prompts, grpo_sampling_params)
         all_prompts = []
         all_responses = []
         all_answers = []
@@ -597,8 +644,10 @@ def train_grpo(
                 all_responses.append(output.text)
                 all_answers.append(answer)
 
-        logging.info(f"[grpo train] Generated output for question, total rollout data {len(all_prompts)}:")
-        print_rich_dict({"prompt": all_prompts[0], "responses": all_responses[0], "answers": all_answers[0]})
+        logging.info(f"[grpo train] Generated output for question, total rollout data {len(all_prompts)}:"
+                    f"{{'prompt': {all_prompts[0]}, 'responses': {all_responses[0]}, 'answers': {all_answers[0]}}}"
+                    )
+        #print_rich_dict({"prompt": all_prompts[0], "responses": all_responses[0], "answers": all_answers[0]})
 
         # (6) / (7): Compute rewards for each sampled output
         advantages_train, raw_rewards_train, metadata = compute_group_normalized_rewards(
@@ -625,7 +674,7 @@ def train_grpo(
 
         # (8): Save model params to cpu_state_dict
         cpu_state_dict = save_model_state_dict(model)
-        logging.info(f"[grpo train] Grpo step_{grpo_step+1} save model state dict to cpu_state_dict....")
+        logging.info(f"[grpo train] grpo step_{grpo_step+1} save model state dict to cpu_state_dict....")
         # Evaluate
         if (grpo_step + 1) % train_config.eval_steps == 0:
             # save model&tokenizer every eval_step
@@ -703,7 +752,10 @@ def main(
     print_rich_dict({"train config": asdict(train_config), 
                     "eval config": asdict(eval_config)})
 
-    vllm = init_vllm(model_id=local_model_path, device=train_config.rollout_device, seed=seed)
+    rollout_vllm = init_vllm(model_id=local_model_path, 
+                     device=train_config.rollout_device, 
+                     seed=seed,
+                     gpu_memory_utilization=train_config.rollout_gpu_mem_util)
     prompts, cot, answers = load_and_format_prompts(train_config.data_path, train_config.prompt_path)
 
     train_grpo(
@@ -712,13 +764,21 @@ def main(
         train_prompts=prompts,
         train_cot=cot,
         train_answers=answers,
-        vllm=vllm,
+        rollout_vllm=rollout_vllm,
     )
 
     wandb.finish()
 
 # 实验控制变量:
 if __name__ == "__main__":
+    # Ensure CUDA works with multiprocessing by using spawn instead of fork
+    import multiprocessing as mp
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        # Start method may have been set elsewhere; ignore if already set
+        pass
+    
     parser = ArgumentParser()
     parser.add_argument("--sub_experiment_name", type=str, default="grpo_learning_rate", help="sub_experiment_name")
     parser.add_argument("--n_grpo_steps", type=int, default=200, help="n_grpo_steps")
