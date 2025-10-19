@@ -313,32 +313,35 @@ def get_old_log_probs(
 
     input_ids = input_ids.to(train_config.train_device)
     labels = labels.to(train_config.train_device)
+    with torch.no_grad():
+        # group_size 一组question 计算
+        for train_step in range(0, train_config.n_prompts_per_rollout_batch):
+            start_index = train_step * train_config.group_size
+            input_ids_part = input_ids[
+                start_index : start_index + train_config.group_size,
+                :,
+            ]
+            labels_part = labels[
+                start_index : start_index + train_config.group_size,
+                :,
+            ]
 
-    # group_size 一组question 计算
-    for train_step in range(0, train_config.n_prompts_per_rollout_batch):
-        start_index = train_step * train_config.group_size
-        input_ids_part = input_ids[
-            start_index : start_index + train_config.group_size,
-            :,
-        ]
-        labels_part = labels[
-            start_index : start_index + train_config.group_size,
-            :,
-        ]
+            out = get_response_log_probs(
+                model=model,
+                input_ids=input_ids_part,
+                labels=labels_part,
+                return_token_entropy=True,
+            )
 
-        out = get_response_log_probs(
-            model=model,
-            input_ids=input_ids_part,
-            labels=labels_part,
-            return_token_entropy=True,
-        )
-
-        log_probs.extend(out["log_probs"].tolist())
-        token_entropy.extend(out["token_entropy"].tolist())
-
-        del out
-        clear()
-
+            # Accumulate tensors directly; avoid per-iteration GPU->CPU sync
+            log_probs.append(out["log_probs"])  # tensor of shape (group_size, seq_len) or similar
+            token_entropy.append(out["token_entropy"])  # tensor
+            # del out
+            # clear()
+            
+    # After loop, concatenate tensors and convert to lists once
+    log_probs = torch.cat(log_probs, dim=0).tolist()
+    token_entropy = torch.cat(token_entropy, dim=0).tolist()
     assert len(log_probs) == input_ids.shape[0]
     assert len(token_entropy) == input_ids.shape[0]
 

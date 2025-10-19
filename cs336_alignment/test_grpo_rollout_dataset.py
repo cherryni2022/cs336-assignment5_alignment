@@ -103,43 +103,51 @@ class TrainConfig:
 # 计算一次log_probs
 def get_old_log_probs(
     model, input_ids, labels, 
-    train_device,
-    n_prompts_per_rollout_batch, group_size
+    train_config
 ) -> tuple[list[list[float]], list[list[float]]]:
+    logging.info(f"[get_old_log_probs] 当前 model.training={model.training}")
     is_training = model.training
     model.eval()
-
+    logging.info(f"[get_old_log_probs] 当前 model.training={model.training}")
+    logging.info(f"[get_old_log_probs] 计算 log_probs 开始")
     log_probs = []
     token_entropy = []
 
     input_ids = input_ids.to(train_config.train_device)
     labels = labels.to(train_config.train_device)
+    with torch.no_grad():
+        # group_size 一组question 计算
+        for train_step in range(0, train_config.n_prompts_per_rollout_batch):
+            start_index = train_step * train_config.group_size
+            input_ids_part = input_ids[
+                start_index : start_index + train_config.group_size,
+                :,
+            ]
+            labels_part = labels[
+                start_index : start_index + train_config.group_size,
+                :,
+            ]
+            start_compute = time.time()
+            out = get_response_log_probs(
+                model=model,
+                input_ids=input_ids_part,
+                labels=labels_part,
+                return_token_entropy=True,
+            )
 
-    # group_size 一组question 计算
-    for train_step in range(0, train_config.n_prompts_per_rollout_batch):
-        start_index = train_step * train_config.group_size
-        input_ids_part = input_ids[
-            start_index : start_index + train_config.group_size,
-            :,
-        ]
-        labels_part = labels[
-            start_index : start_index + train_config.group_size,
-            :,
-        ]
+            # Accumulate tensors directly; avoid per-iteration GPU->CPU sync
+            log_probs.append(out["log_probs"])  # tensor of shape (group_size, seq_len) or similar
+            token_entropy.append(out["token_entropy"])  # tensor
+            compute_time = time.time() - start_compute
+            logging.info(f"[get_old_log_probs] 计算 train_step_{train_step} log_probs 耗时: {compute_time*1000:.2f}ms")
 
-        out = get_response_log_probs(
-            model=model,
-            input_ids=input_ids_part,
-            labels=labels_part,
-            return_token_entropy=True,
-        )
+            # logging.info(f"[get_old_log_probs] 计算 train_step_{train_step} clear 耗时: {clear_time*1000:.2f}ms")
 
-        log_probs.extend(out["log_probs"].tolist())
-        token_entropy.extend(out["token_entropy"].tolist())
-
-        del out
-        clear()
-
+    clear()
+    # After loop, concatenate tensors and convert to lists once
+    log_probs = torch.cat(log_probs, dim=0).tolist()
+    token_entropy = torch.cat(token_entropy, dim=0).tolist()
+    
     assert len(log_probs) == input_ids.shape[0]
     assert len(token_entropy) == input_ids.shape[0]
 
@@ -148,12 +156,13 @@ def get_old_log_probs(
 
 
 def test_log_probs():
+    train_config = TrainConfig()
     train_sample_num = 256
     prompts, cot, answers = load_and_format_prompts(train_config.data_path, train_config.prompt_path)
     train_prompts = prompts[:train_sample_num]
     train_cot = cot[:train_sample_num]
     train_answers = answers[:train_sample_num]
-    
+
     model = AutoModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path=train_config.local_model_path,
         torch_dtype=torch.bfloat16,
@@ -170,17 +179,18 @@ def test_log_probs():
     input_ids = encoded["input_ids"]
     labels = encoded["labels"]
     response_mask = encoded["response_mask"]
-
+    start = time.time()
     old_log_probs, token_entropy = get_old_log_probs(
-        model, input_ids, labels, train_config.train_device,
-        train_config.n_prompts_per_rollout_batch, train_config.group_size
+        model, input_ids, labels, train_config
     )
+    elapsed = time.time() - start
     logging.info(f"[GRPORolloutDataset] generate Rollout Dataset Done, "
-                    f"input_ids.len={len(input_ids)},"
-                    f"labels.len={len(labels)},"
-                    f"response_mask.len={len(response_mask)},"
-                    f"old_log_probs.len={len(old_log_probs)},"
-                    f"token_entropy.len={len(token_entropy)}")
+                 f"input_ids.len={len(input_ids)},"
+                 f"labels.len={len(labels)},"
+                 f"response_mask.len={len(response_mask)},"
+                 f"old_log_probs.len={len(old_log_probs)},"
+                 f"token_entropy.len={len(token_entropy)},"
+                 f"耗时={elapsed*1000:.2f}ms")
 
 if __name__ == "__main__":
     test_log_probs()
