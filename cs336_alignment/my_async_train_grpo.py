@@ -336,10 +336,10 @@ def get_old_log_probs(
             # Accumulate tensors directly; avoid per-iteration GPU->CPU sync
             log_probs.append(out["log_probs"])  # tensor of shape (group_size, seq_len) or similar
             token_entropy.append(out["token_entropy"])  # tensor
-            # del out
-            # clear()
-            
+
+    
     # After loop, concatenate tensors and convert to lists once
+    clear()
     log_probs = torch.cat(log_probs, dim=0).tolist()
     token_entropy = torch.cat(token_entropy, dim=0).tolist()
     assert len(log_probs) == input_ids.shape[0]
@@ -358,7 +358,6 @@ class GRPORolloutDataset(Dataset):
     def __init__(
         self, model, prompts, responses, raw_rewards, advantages, train_config: TrainConfig, tokenizer
     ):
-        logging.info("[GRPORolloutDataset] init and generate GRPORolloutDataset...")
         self.raw_rewards = raw_rewards
         self.advantages = advantages
 
@@ -374,7 +373,7 @@ class GRPORolloutDataset(Dataset):
 
         # We need calculate the old log probs using old model,
         self.old_log_probs, self.token_entropy = get_old_log_probs(model, input_ids, labels, train_config)
-        logging.info(f"[GRPORolloutDataset] generate Rollout Dataset Done, "
+        logging.info(f"[GRPORolloutDataset] init generate Rollout Dataset Done, "
                     f"input_ids.len={len(self.input_ids)},"
                     f"labels.len={len(self.labels)},"
                     f"response_mask.len={len(self.response_mask)},"
@@ -444,6 +443,12 @@ def update_policy(
         advantages = advantages.to(train_config.train_device)
         raw_rewards = raw_rewards.to(train_config.train_device)
         
+        # Compute advantage summary stats for logging and wandb
+        advantages_mean = to_float(advantages.mean())
+        advantages_std = to_float(advantages.std(unbiased=False))
+        advantages_min = to_float(advantages.min())
+        advantages_max = to_float(advantages.max())
+
         batch_mean_response_length = response_mask.sum(dim=-1).mean(dtype=torch.float32)
         batch_loss = 0
         accumulated_token_entropy = 0
@@ -493,7 +498,8 @@ def update_policy(
                     f" | avg_response_entropy: {accumulated_token_entropy / train_config.gradient_accumulation_steps:.4f}"
                     f" | avg_clip_fraction: {accumulated_clip_fraction / train_config.gradient_accumulation_steps:.4f}"
                     f" | response_mask_entropy: {entropy[response_mask_micro].mean().item():.6f}"
-                    f" | Global Entropy: {entropy.mean().item():.6f}"
+                    f" | advantages_mean: {advantages_mean:.6f} | advantages_std: {advantages_std:.6f} | advantages_min: {advantages_min:.6f} | advantages_max: {advantages_max:.6f}"
+                    #f" | Global Entropy: {entropy.mean().item():.6f}"
                     #f" | Prompt Entropy: {entropy[~response_mask_micro].mean().item():.6f}"
                 )
         
@@ -507,6 +513,10 @@ def update_policy(
                         "train/avg_clip_fraction": accumulated_clip_fraction / train_config.gradient_accumulation_steps,
                         "train/grad_norm": grad_norm,
                         "train/mean_response_length": batch_mean_response_length,
+                        "train/advantages_mean": advantages_mean,
+                        "train/advantages_std": advantages_std,
+                        "train/advantages_min": advantages_min,
+                        "train/advantages_max": advantages_max,
                         "train_step": global_step_ + 1
                     }, step=global_step_)
 
