@@ -84,7 +84,7 @@ class TrainConfig:
     learning_rate: float = 1e-5
     betas: tuple[float, float] = (0.9, 0.95)
 
-    eval_steps: int = 2
+    eval_steps: int = 8
     
     rollout_device: str = "cuda:1"
     eval_device: str = "cuda:1"
@@ -117,14 +117,14 @@ class TrainConfig:
         self.train_batch_size = self.micro_train_batch_size * self.gradient_accumulation_steps
 
         self.train_steps_per_rollout_batch = total_train_data_per_grpo_step // self.train_batch_size
-        logging.info(f"[trainConfig] after init train_batch_size: {self.train_batch_size},"
-                    f"micro_train_batch_size:{self.micro_train_batch_size},"
-                    f"gradient_accumulation_steps: {self.gradient_accumulation_steps},"
-                    f"rollout_batch_size:{self.rollout_batch_size}, group_size:{self.group_size},"
-                    f"n_prompts_per_rollout_batch:{self.n_prompts_per_rollout_batch},"
-                    f"epochs_per_rollout_batch:{self.epochs_per_rollout_batch},"
-                    f"n_microbatches_per_rollout_batch:{self.n_microbatches_per_rollout_batch},"
-                    f"train_steps_per_rollout_batch:{self.train_steps_per_rollout_batch}")
+        # logging.info(f"[trainConfig] after init train_batch_size: {self.train_batch_size},"
+        #             f"micro_train_batch_size:{self.micro_train_batch_size},"
+        #             f"gradient_accumulation_steps: {self.gradient_accumulation_steps},"
+        #             f"rollout_batch_size:{self.rollout_batch_size}, group_size:{self.group_size},"
+        #             f"n_prompts_per_rollout_batch:{self.n_prompts_per_rollout_batch},"
+        #             f"epochs_per_rollout_batch:{self.epochs_per_rollout_batch},"
+        #             f"n_microbatches_per_rollout_batch:{self.n_microbatches_per_rollout_batch},"
+        #             f"train_steps_per_rollout_batch:{self.train_steps_per_rollout_batch}")
 
 @dataclass
 class EvaluateConfig:
@@ -222,7 +222,9 @@ def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue,
         if api_key:
             wandb.login(key=api_key)
             logging.info("[eval-worker] wandb.login succeeded via WANDB_API_KEY")
+        wandb_entity = os.getenv("WANDB_ENTITY")
         date_str = time.strftime("%m%d-%H%M%S")
+        policy_type = "on_policy" if train_config.epochs_per_rollout_batch == 1 else "off_policy"
         wandb.init(
             entity=wandb_entity,
             project="cs336-grpo",
@@ -271,7 +273,7 @@ def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue,
             break
         elif ctype == "update_weights":
             cpu_sd = cmd.get("state_dict")
-            _load_weights_from_state_dict(llm, cpu_sd, device)
+            _load_weights_from_state_dict(llm, cpu_sd, train_config.eval_device)
             res_q.put({"type": "ack", "op": "update_weights"})
         elif ctype == "evaluate":
             step: int = cmd.get("step", 0)
@@ -583,11 +585,11 @@ def train_grpo(
     ).to(train_config.train_device)
     tokenizer = AutoTokenizer.from_pretrained(train_config.model_name)
     optimizer = torch.optim.AdamW(model.parameters(), weight_decay=0.0,lr=train_config.learning_rate, betas=train_config.betas)
-    logging.info(f"[grpo train] Tokenizer {train_config.model_name} loaded from {train_config.local_model_path}")
+    #logging.info(f"[grpo train] Tokenizer {train_config.model_name} loaded from {train_config.local_model_path}")
     logging.info(f"[grpo train] Model {train_config.model_name} loaded on device: {train_config.train_device},"
                 f" will eval on device:{train_config.eval_device}"
                 f" from {train_config.local_model_path}")
-    logging.info("[grpo train] Optimizer loaded")
+    #logging.info("[grpo train] Optimizer loaded")
 
     # This will return the batch data for grpo step
     base_ds = GRPODataset(train_prompts, train_cot, train_answers)
@@ -619,16 +621,15 @@ def train_grpo(
         daemon=True,
     )
     eval_p.start()
-    logging.info(f"[grpo main] evaluate worker started on {train_config.eval_device} with process isolation")
+    logging.info(f"[grpo train] evaluate worker started on {train_config.eval_device} with process isolation")
     # 初次加载训练权重到vLLM(evaluate)实例
     eval_cmd_q.put({"type": "update_weights", "state_dict": cpu_state_dict})
     # 等待权重加载完成的确认
     _ = eval_res_q.get()
-    logging.info("[grpo main] weights loaded into vLLM(evaluate) instance")
+    logging.info("[grpo train] weights loaded into vLLM(evaluate) instance")
 
     global_step = 0
     for grpo_step in range(train_config.n_grpo_steps):
-        logging.info(f"[grpo train] start grpo step_{grpo_step+1}")
         # Sample a batch of questions from dataset
         sample_batch = next(cycled_dataloader)
         # sample_prompts, sample_cots, sample_answers = zip(*sample_batch)
@@ -637,13 +638,13 @@ def train_grpo(
         sample_cots = list(sample_cots)
         sample_answers = list(sample_answers)
 
-        logging.info(f"[grpo train] grpo step_{grpo_step+1} sample batch: {len(sample_prompts)}"
+        logging.info(f"[grpo train] start grpo step_{grpo_step+1} sample batch: {len(sample_prompts)}"
                     f", sample_prompts[0]: {sample_prompts[0]}, "
                     f"sample_cots[0]: {sample_cots[0]}, "
                     f"sample_answers[0]: {sample_answers[0]}")
 
         # load model params from cpu_state_dict to vllm(rollout) instance
-        _load_weights_from_state_dict(vllm, cpu_state_dict, train_config.rollout_device)
+        _load_weights_from_state_dict(rollout_vllm, cpu_state_dict, train_config.rollout_device)
 
         # (5): Sample G outputs per question.
         #logging.info(f"[grpo train] grpo step_{grpo_step+1} Generating {train_config.group_size} outputs for each rollout samples {len(sample_prompts)}...")
@@ -659,7 +660,7 @@ def train_grpo(
 
         logging.info(f"[grpo train] Generated output for question, total rollout data {len(all_prompts)}:"
                     f"{{'prompt': {all_prompts[0]}, 'responses': {all_responses[0]}, 'answers': {all_answers[0]}}}"
-                    )
+            )
         #print_rich_dict({"prompt": all_prompts[0], "responses": all_responses[0], "answers": all_answers[0]})
 
         # (6) / (7): Compute rewards for each sampled output

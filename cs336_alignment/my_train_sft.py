@@ -217,7 +217,7 @@ def evaluate_vllm(vllm_model: LLM,
     response_length = 0
     correct_response_length = 0
     incorrect_response_length = 0
-    log_samples = 3
+    log_samples = 2
     allinfo_dict_list = []
     for prompt, response, answer in zip(prompts, responses, answers):
         reward_dict = reward_fn(response, answer)
