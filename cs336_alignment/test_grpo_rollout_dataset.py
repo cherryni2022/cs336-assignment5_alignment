@@ -84,7 +84,7 @@ class TrainConfig:
 
     eval_steps: int = 2
     
-    rollout_device: str = "cuda:1"
+    rollout_device: str = "cuda:0"
     eval_device: str = "cuda:1"
     train_device: str = "cuda:0"
     rollout_gpu_mem_util: float = 0.45
@@ -192,5 +192,50 @@ def test_log_probs():
                  f"token_entropy.len={len(token_entropy)},"
                  f"耗时={elapsed*1000:.2f}ms")
 
+def test_compute_group_normalized_rewards():
+    train_config = TrainConfig()
+    train_sample_num = 32
+    prompts, cot, answers = load_and_format_prompts(train_config.data_path, train_config.prompt_path)
+    sample_prompts = prompts[:train_sample_num]
+    sample_cot = cot[:train_sample_num]
+    sample_answers = answers[:train_sample_num]
+    # rollout_vllm = init_vllm(model_id=train_config.local_model_path, 
+    #                  device=train_config.rollout_device, 
+    #                  seed=132,
+    #                  gpu_memory_utilization=0.85)
+
+    # grpo_sampling_params = SamplingParams(
+    #     temperature=train_config.temperature,
+    #     top_p=train_config.top_p,
+    #     max_tokens=train_config.max_tokens,
+    #     min_tokens=train_config.min_tokens,
+    #     stop=train_config.stop_tokens,
+    #     include_stop_str_in_output=train_config.include_stop_str_in_output,
+    #     n=train_config.group_size,
+    #     seed=train_config.vllm_seed,
+    # )
+
+    # all_gens = rollout_vllm.generate(sample_prompts, grpo_sampling_params)
+    all_prompts = []
+    all_responses = []
+    all_answers = []
+    for question, answer, cot in zip(sample_prompts, sample_answers, sample_cot):
+        for x in range(train_config.group_size):
+            all_prompts.append(question)
+            all_responses.append(cot)
+            all_answers.append(answer)
+
+    advantages, raw_rewards, metadata = compute_group_normalized_rewards(
+            r1_zero_reward_fn,
+            rollout_responses=all_responses,
+            repeated_ground_truths=all_answers,
+            group_size=train_config.group_size,
+            advantage_eps=train_config.advantage_eps,
+            normalized_by_std=train_config.use_std_normalization,
+    )
+    print(f"[compute_group_normalized_rewards test] advantage.shape:, {advantages.shape},"
+        f", raw_rewards.shape: {raw_rewards.shape}")
+
 if __name__ == "__main__":
-    test_log_probs()
+    #test_log_probs()
+    test_compute_group_normalized_rewards()

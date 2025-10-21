@@ -394,9 +394,9 @@ class GRPORolloutDataset(Dataset):
         input_ids = self.input_ids[idx]  # Tensor: [1, seq_len]
         labels = self.labels[idx]  # Tensor: [1, seq_len]
         response_mask = self.response_mask[idx]  # Tensor: [1, seq_len]
-        raw_reward = self.raw_rewards[idx]
+        raw_reward = self.raw_rewards[idx].unsqueeze(-1) # tensor: [B, 1]
         advantage = self.advantages[idx]
-        advantage = advantage.unsqueeze(-1)
+        advantage = advantage.unsqueeze(-1)  # tensor: [B, 1]
         old_log_probs = self.old_log_probs[idx]
 
         return input_ids, labels, response_mask, raw_reward, advantage, torch.tensor(old_log_probs)
@@ -440,32 +440,11 @@ def update_policy(
     global_step_ = global_train_step
     # train_steps_per_rollout_batch = epoches * rollout_batch_size/train_batch_size
     for train_step in range(train_config.train_steps_per_rollout_batch):
-        # Fetch the next train_batch_size
-        #train_batch = next(cycled_dataloader)
-        # input_ids, labels, response_mask, raw_rewards, advantages, old_log_probs = next(cycled_dataloader)
-        # input_ids = input_ids.to(train_config.train_device)
-        # labels = labels.to(train_config.train_device)
-        # response_mask = response_mask.to(train_config.train_device)
-        # old_log_probs = old_log_probs.to(train_config.train_device)
-        # #old_entropy = entropy.to(train_config.train_device)
-        # advantages = advantages.to(train_config.train_device)
-        # raw_rewards = raw_rewards.to(train_config.train_device)
-        
         # Compute advantage summary stats for logging and wandb
-        
         batch_loss = 0
         accumulated_token_entropy = 0
         accumulated_clip_fraction = 0
-
         for train_microstep in range(train_config.gradient_accumulation_steps):
-            # start_index = train_microstep * train_config.micro_train_batch_size
-            # end_index = (train_microstep + 1) * train_config.micro_train_batch_size
-            # input_ids_micro = input_ids[start_index:end_index]
-            # labels_micro = labels[start_index:end_index]
-            # response_mask_micro = response_mask[start_index:end_index]
-            # advantages_micro = advantages[start_index:end_index]
-            # raw_rewards_micro = raw_rewards[start_index:end_index]
-            # old_log_probs_micro = old_log_probs[start_index:end_index]
             input_ids, labels, response_mask, raw_rewards, advantages, old_log_probs = next(cycled_dataloader)
             input_ids_micro = input_ids.to(train_config.train_device)
             labels_micro = labels.to(train_config.train_device)

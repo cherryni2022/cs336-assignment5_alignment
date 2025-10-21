@@ -31,8 +31,7 @@ def compute_group_normalized_rewards(
         'max': torch.max(raw_rewards),
         'min': torch.min(raw_rewards)
     }
-    print(f"[compute_group_normalized_rewards test] advantage.shape:", {advantage.shape},"
-          f", raw_rewards.shape: {raw_rewards.shape}")
+
     return advantage, raw_rewards, metadata
 
 def compute_naive_policy_gradient_loss(
