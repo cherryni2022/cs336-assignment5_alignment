@@ -466,7 +466,19 @@ def update_policy(
                 log_probs = log_probs_dict["log_probs"]
                 entropy = log_probs_dict["token_entropy"]
                 #policy_log_probs = log_probs.to(train_config.train_device)
-                loss, metadata = grpo_microbatch_train_step(
+                # use masked_mean 计算loss
+                # loss, metadata = grpo_microbatch_train_step(
+                #     log_probs,
+                #     response_mask_micro,
+                #     train_config.gradient_accumulation_steps,
+                #     loss_type=train_config.loss_type,
+                #     raw_rewards=raw_rewards_micro,
+                #     advantages=advantages_micro,
+                #     old_log_probs=old_log_probs_micro,
+                #     cliprange=0.2,
+                # )
+                # use masked_normalize 计算loss
+                loss, metadata = grpo_microbatch_train_step_normalize(
                     log_probs,
                     response_mask_micro,
                     train_config.gradient_accumulation_steps,
@@ -476,7 +488,7 @@ def update_policy(
                     old_log_probs=old_log_probs_micro,
                     cliprange=0.2,
                 )
-
+                
                 avg_token_entropy = masked_mean(entropy, response_mask_micro, dim=None)
                 accumulated_token_entropy += avg_token_entropy.item()
                 # TODO: loss_type = grpo_clip
@@ -712,6 +724,7 @@ def main(
     train_batch_size:int ,
     micro_batch_size: int,
     sub_experiment_name: str,
+    masked_mean_or_normalize: str,
     model_name: str = "Qwen/Qwen2.5-Math-1.5B",
     local_model_path: str = os.path.join(PROJECT_DIR, "models/Qwen2.5-Math-1.5B-Base"),
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train.jsonl"),
@@ -737,6 +750,7 @@ def main(
 
     # Set train config
     train_config.sub_experiment_name = sub_experiment_name
+    train_config.masked_mean_or_normalize = masked_mean_or_normalize
     train_config.n_grpo_steps = n_grpo_steps
     train_config.rollout_batch_size = rollout_batch_size
     train_config.group_size = group_size
@@ -796,6 +810,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs_per_rollout_batch", type=int, default=1, help="epochs_per_rollout_batch")
     parser.add_argument("--use_std_normalization", type=bool, default=True, help="use_std_normalization")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="learning_rate")
+    #masked_mean or masked_normalize
+    parser.add_argument("--masked_mean_or_normalize", type=str, default="masked_mean", help="masked_mean_or_normalize")
     # type:no_baseline,reinforce_with_baseline,grpo_clip
     parser.add_argument("--loss_type", type=str, default="reinforce_with_baseline", help="loss_type in no_baseline,grpo_clip,reinforce_with_baseline")
     parser.add_argument("--train_batch_size", type=int, default=256, help="train_batch_size")
@@ -813,4 +829,5 @@ if __name__ == "__main__":
                     train_batch_size=args.train_batch_size,
                     micro_batch_size=args.micro_batch_size,
                     sub_experiment_name=args.sub_experiment_name,
+                    masked_mean_or_normalize=args.masked_mean_or_normalize,
                     ))
