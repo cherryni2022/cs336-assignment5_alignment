@@ -32,3 +32,19 @@ loss_type="no_baseline"
 sub_experiment="effect_of_baselining"
 echo "python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1"
 python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1
+
+
+# 3. use_std_normalization=False
+sub_experiment="effect_of_std_normalization"
+use_std_normalization=False
+python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --use_std_normalization $use_std_normalization > grpo_${sub_experiment}_${learning_rate}_nostd_${current_time}.log 2>&1
+
+
+# 4.观察比较 off-policy / on-policy 效果
+#sub_experiment="effect_of_on_policy_vs_off_policy"
+#loss_type="grpo_clip"
+#epochs_per_rollout_batch=3
+#echo "python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1"
+#python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1
+
+
