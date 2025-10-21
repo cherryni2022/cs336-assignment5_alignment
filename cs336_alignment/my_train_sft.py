@@ -207,7 +207,8 @@ def evaluate_vllm(vllm_model: LLM,
     reward_fn: Callable[[str, str], dict[str, float]],
     prompts: List[str],
     answers: List[str],
-    eval_sampling_params: SamplingParams,):
+    eval_sampling_params: SamplingParams,
+    eval_step: int):
     logging.info(f"[evaluate_vllm] Evaluating {len(prompts)} samples.")
     responses = get_vllm_response(vllm_model, prompts, eval_sampling_params)
     total = len(prompts)
@@ -244,7 +245,7 @@ def evaluate_vllm(vllm_model: LLM,
             incorrect_response_length += len(response)
         
         if log_samples > 0:
-            logging.info(f"[eval] sample prompt: {prompt}"
+            logging.info(f"[evaluate] Step: {eval_step}; sample prompt: {prompt}"
                         f", response: {response}"
                         f", answer: {answer}"
                         f", reward_result: {reward_dict}")
@@ -280,7 +281,8 @@ def evaluate_sft_model(config: EvaluateConfig, vllm: LLM, eval_step: int):
         stop=["</answer>"],
         include_stop_str_in_output=True,
     )
-    results, outinfo_dict_list = evaluate_vllm(vllm, r1_zero_reward_fn, prompts, answers, sampling_params)
+    results, outinfo_dict_list = evaluate_vllm(vllm, r1_zero_reward_fn, 
+                            prompts, answers, sampling_params, eval_step)
 
     wandb.log(
         {
@@ -303,11 +305,17 @@ def evaluate_sft_model(config: EvaluateConfig, vllm: LLM, eval_step: int):
     #eval_result_dir.mkdir(parents=True, exist_ok=True)
     out_file = os.path.join(eval_result_dir, f"evaluate_{eval_step}.jsonl")
     logging.info(f"[eval] Writing results to {out_file}")
+    # 抽一部分错误的样本, 方便人工检查
+    incorrect_cnt = 8
     with open(out_file, "w", encoding="utf-8") as f:
         for result in outinfo_dict_list:
             if result["extracted_answer"] == result["true_answer"] or result["reward"] == 1:
                 json.dump(result, f)
                 f.write("\n")
+            elif incorrect_cnt > 0:
+                json.dump(result, f)
+                f.write("\n")
+                incorrect_cnt -= 1
     logging.info(f"[eval] Writing results to {out_file} finish ===========")
 
 # 针对超参数配置sft训练模型
