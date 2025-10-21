@@ -19,7 +19,7 @@ import gc
 from dataclasses import asdict, dataclass, field
 from cs336_alignment.data_utils import load_and_format_prompts
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from cs336_alignment.grpo import compute_group_normalized_rewards, grpo_microbatch_train_step, masked_mean
+from cs336_alignment.grpo import compute_group_normalized_rewards, grpo_microbatch_train_step, grpo_microbatch_train_step_normalize,masked_mean
 from cs336_alignment.sft_utils import get_response_log_probs, tokenize_prompt_and_output
 from cs336_alignment.utils import (
     clear,
@@ -808,7 +808,7 @@ if __name__ == "__main__":
     parser.add_argument("--rollout_batch_size", type=int, default=256, help="total rollout samples per grpo step")
     parser.add_argument("--group_size", type=int, default=8, help="each grpo step sample group_size output per question")
     parser.add_argument("--epochs_per_rollout_batch", type=int, default=1, help="epochs_per_rollout_batch")
-    parser.add_argument("--use_std_normalization", type=bool, default=True, help="use_std_normalization")
+    parser.add_argument("--use_std_normalization", type=bool, default=False, help="use_std_normalization")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="learning_rate")
     #masked_mean or masked_normalize
     parser.add_argument("--masked_mean_or_normalize", type=str, default="masked_mean", help="masked_mean_or_normalize")
