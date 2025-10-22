@@ -67,8 +67,8 @@ class TrainConfig:
     # epochs_per_rollout_batch > 1 off-policy
     epochs_per_rollout_batch: int = 1 # On-policy
     # grpo算法内循环:针对每个grop迭代 rollout_batch的样本, train的steps数
-    # train_steps_per_rollout_batch = rollout_batch_size // train_batch_size
-    train_steps_per_rollout_batch: int = 4
+    # train_steps_per_rollout_batch = epochs_per_rollout_batch*rollout_batch_size // train_batch_size
+    train_steps_per_rollout_batch: int = 1
 
     train_batch_size: int = 256
     gradient_accumulation_steps: int = 32
@@ -85,6 +85,8 @@ class TrainConfig:
     betas: tuple[float, float] = (0.9, 0.95)
 
     eval_steps: int = 8
+    # TODO: for off_policy
+    #eval_steps: int = 2
     
     rollout_device: str = "cuda:1"
     eval_device: str = "cuda:1"
@@ -492,7 +494,7 @@ def update_policy(
                 avg_token_entropy = masked_mean(entropy, response_mask_micro, dim=None)
                 accumulated_token_entropy += avg_token_entropy.item()
                 # TODO: loss_type = grpo_clip
-                #accumulated_clip_fraction += masked_mean(metadata["cliped"], response_mask_micro, dim=None).item()
+                accumulated_clip_fraction += masked_mean(metadata["cliped"], response_mask_micro, dim=None).item()
                 batch_loss += loss.item()
 
             if train_microstep == train_config.gradient_accumulation_steps - 1:
@@ -706,7 +708,8 @@ def train_grpo(
             logging.info(f"[grpo async eval] step_{grpo_step+1}: evaluate update_weights finished....")
 
             logging.info(f"[grpo async eval] step_{grpo_step+1}: dispatch evaluation")
-            eval_cmd_q.put({"type": "evaluate", "step": grpo_step+1})
+            # TODO: off_policy训练 epochs_per_rollout_batch > 1, 一轮grpo_step中多次train_step=train_steps_per_rollout_batch
+            eval_cmd_q.put({"type": "evaluate", "step": (grpo_step+1)*train_config.train_steps_per_rollout_batch})
 
       
     save_model_and_tokenizer(model, tokenizer, train_config, train_config.sub_experiment_name)
@@ -725,6 +728,7 @@ def main(
     micro_batch_size: int,
     sub_experiment_name: str,
     masked_mean_or_normalize: str,
+    eval_steps: int,
     model_name: str = "Qwen/Qwen2.5-Math-1.5B",
     local_model_path: str = os.path.join(PROJECT_DIR, "models/Qwen2.5-Math-1.5B-Base"),
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train.jsonl"),
@@ -750,7 +754,9 @@ def main(
 
     # Set train config
     train_config.sub_experiment_name = sub_experiment_name
+    eval_config.eval_result_dir = os.path.join(PROJECT_DIR, f"evaluations/grpo/{sub_experiment_name}")
     train_config.masked_mean_or_normalize = masked_mean_or_normalize
+    train_config.eval_steps = eval_steps
     train_config.n_grpo_steps = n_grpo_steps
     train_config.rollout_batch_size = rollout_batch_size
     train_config.group_size = group_size
@@ -816,6 +822,7 @@ if __name__ == "__main__":
     parser.add_argument("--loss_type", type=str, default="reinforce_with_baseline", help="loss_type in no_baseline,grpo_clip,reinforce_with_baseline")
     parser.add_argument("--train_batch_size", type=int, default=256, help="train_batch_size")
     parser.add_argument("--micro_batch_size", type=int, default=8, help="micro_batch_size")
+    parser.add_argument("--eval_steps", type=int, default=8, help="eval_step")
     
     args = parser.parse_args()
     logging.info(f"start train grpo with params: {args}")
@@ -830,4 +837,5 @@ if __name__ == "__main__":
                     micro_batch_size=args.micro_batch_size,
                     sub_experiment_name=args.sub_experiment_name,
                     masked_mean_or_normalize=args.masked_mean_or_normalize,
+                    eval_steps=args.eval_steps
                     ))
