@@ -54,9 +54,8 @@ def compute_grpo_no_clip_loss(
     batch_size, seq_len = policy_log_probs.shape
     advantages = repeat(advantages, "b 1 -> b s", s=seq_len)
     v = pi_ratio * advantages
-    v_clip = torch.clip(pi_ratio, min=1 - cliprange, max=1 + cliprange) * advantages
     meta = {"cliped": v>=10}
-    return -torch.min(v, v_clip), meta
+    return -v, meta
  
 def compute_grpo_clip_loss(
     advantages: torch.Tensor,
@@ -133,6 +132,12 @@ def compute_policy_gradient_loss(
         #         "clip_fraction": clip_fraction,
         #     }
         # )
+        return loss, meta
+    elif loss_type == "grpo_no_clip":
+        assert advantages is not None
+        assert old_log_probs is not None
+        assert cliprange is not None
+        loss, meta = compute_grpo_no_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
         return loss, meta
 
 def masked_mean(

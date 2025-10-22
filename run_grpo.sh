@@ -45,11 +45,21 @@ masked_mean_or_normalize="masked_normalize"
 #echo "python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --use_std_normalization $use_std_normalization --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1"
 #python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --use_std_normalization $use_std_normalization --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1
 
-# 4. use_std_normalization=False
-sub_experiment="grpo_group_standard_deviation"
-loss_type="reinforce_with_baseline"
-use_std_normalization=False
+# 7. prompt 消融试验(grpo_prompt_ablation)
+sub_experiment="grpo_prompt_ablation"
+#use_std_normalization=True
 masked_mean_or_normalize="masked_normalize"
+epochs_per_rollout_batch=1
+loss_type="reinforce_with_baseline"
+echo "python cs336_alignment/my_async_train_grpo_no_prompt.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1"
+python cs336_alignment/my_async_train_grpo_no_prompt.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --use_std_normalization $use_std_normalization --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1
+
+# 4. use_std_normalization=False
+# sub_experiment="grpo_group_standard_deviation"
+# loss_type="reinforce_with_baseline"
+# use_std_normalization=False
+# masked_mean_or_normalize="masked_normalize"
+
 # echo "python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_nostd_${current_time}.log 2>&1"
 # python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_nostd_${current_time}.log 2>&1
 
@@ -60,24 +70,24 @@ use_std_normalization=False
 masked_mean_or_normalize="masked_normalize"
 loss_type="grpo_clip"
 epochs_per_rollout_batch=3
-echo "python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --eval_steps 2 --learning_rate $learning_rate --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1"
-python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --eval_steps 2 --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1
+#train_batch_size=256 默认
+#train_batch_size=128
+eval_steps=2
+# echo "python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --eval_steps 2 --train_batch_size $train_batch_size --learning_rate $learning_rate --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1"
+# python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --train_batch_size $train_batch_size --eval_steps 2 --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1
+train_batch_size=256
+epochs_per_rollout_batch=2
+eval_steps=4
+# echo "python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --eval_steps $eval_steps --train_batch_size $train_batch_size --learning_rate $learning_rate --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1"
+# python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --train_batch_size $train_batch_size --eval_steps $eval_steps --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1
+
 
 # 6. Off-policy GRPO-Clip ablation(grpo_off_policy_clip_ablation)消融试验
-# sub_experiment="grpo_off_policy_clip_ablation"
-# use_std_normalization=False
-# masked_mean_or_normalize="masked_normalize"
-# loss_type="no_clip"
-# epochs_per_rollout_batch=3
+sub_experiment="grpo_off_policy_clip_ablation"
+use_std_normalization=False
+masked_mean_or_normalize="masked_normalize"
+loss_type="grpo_no_clip"
+# epochs_per_rollout_batch=2
 # echo "python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1"
-# python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1
+# python cs336_alignment/my_async_train_grpo_no_clip.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1
 
-# 7. prompt 消融试验(grpo_prompt_ablation)
-# sub_experiment="grpo_prompt_ablation"
-# use_std_normalization=False
-# masked_mean_or_normalize="masked_normalize"
-# loss_type="reinforce_with_baseline"
-# epochs_per_rollout_batch=3
-# no_prompt=True
-# echo "python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1"
-# python cs336_alignment/my_async_train_grpo.py --sub_experiment $sub_experiment --learning_rate $learning_rate --loss_type $loss_type --epochs_per_rollout_batch $epochs_per_rollout_batch --masked_mean_or_normalize $masked_mean_or_normalize > grpo_${sub_experiment}_${learning_rate}_${current_time}.log 2>&1
