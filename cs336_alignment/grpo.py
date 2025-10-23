@@ -76,13 +76,13 @@ def compute_grpo_clip_loss(
 
 def compute_policy_gradient_loss(
     policy_log_probs: torch.Tensor,
-    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_no_clip"],
     raw_rewards: torch.Tensor | None=None,
     advantages: torch.Tensor | None=None,
     old_log_probs: torch.Tensor | None=None,
     cliprange: float | None=None
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    assert loss_type in {"no_baseline", "reinforce_with_baseline", "grpo_clip"}, (
+    assert loss_type in {"no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_no_clip"}, (
             f"Unknown loss_type: {loss_type}"
         )
     B, T = policy_log_probs.shape
@@ -153,7 +153,7 @@ def grpo_microbatch_train_step(
         policy_log_probs: torch.Tensor,
         response_mask: torch.Tensor,
         gradient_accumulation_steps: int,
-        loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+        loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_no_clip"],
         raw_rewards: torch.Tensor | None=None,
         advantages: torch.Tensor | None=None,
         old_log_probs: torch.Tensor | None=None,

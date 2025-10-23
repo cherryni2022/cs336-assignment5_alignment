@@ -91,7 +91,7 @@ class TrainConfig:
 class EvaluateConfig:
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/test.jsonl")
     prompt_path: str = os.path.join(PROJECT_DIR, "cs336_alignment/prompts/r1_zero.prompt")
-    eval_result_dir: str = os.path.join(PROJECT_DIR, "evaluations")
+    eval_result_dir: str = os.path.join(PROJECT_DIR, "evaluations/sft")
     temperature: float = 1.0
     top_p: float = 1.0
     max_tokens: int = 1024
@@ -390,7 +390,7 @@ def train_sft_model(
     wandb.init(
         entity=os.getenv("WANDB_ENTITY"),
         project="cs336-sft",
-        name=f"train_sft_{data_type}_{train_config.num_train_samples}_b{train_config.sft_train_batch_size}_{lr}_{date_str}",
+        name=f"sft_{data_type}_{train_config.num_train_samples}_b{train_config.sft_train_batch_size}_{lr}_{date_str}",
         config={
             "train_sample": train_config.num_train_samples,
             "learning_rate": train_config.learning_rate,
@@ -496,25 +496,6 @@ def train_sft_model(
                         }
                     )
 
-            # if (sft_step + 1) % train_config.log_print_steps == 0 and evaluate:
-            #     load_model_into_vllm_instance(model, vllm)
-            #     log_generations(
-            #         vllm,
-            #         reward_fn=r1_zero_reward_fn,
-            #         prompts=train_dataset.train_prompts,
-            #         cot=train_dataset.train_cot,
-            #         answers=train_dataset.train_answers,
-            #         eval_sampling_params=SamplingParams(
-            #             temperature=eval_config.temperature,
-            #             top_p=eval_config.top_p,
-            #             max_tokens=eval_config.max_tokens,
-            #             stop=["</answer>"],
-            #             include_stop_str_in_output=True,
-            #         ),
-            #         cur_step=sft_step,
-            #         num_example=3,
-            #     )
-
             #迭代eval_interval_steps次后, vllm评估模型
             if (sft_step + 1) % train_config.eval_interval_steps == 0 and evaluate:
                 logging.info(
@@ -528,7 +509,7 @@ def train_sft_model(
                 eval_future = async_evaluator.start_async_evaluation(model, sft_step)
                 # load_model_into_vllm_instance(model, vllm)
                 # evaluate_sft_model(eval_config, vllm, eval_step=sft_step)
-                logging.info(f"[eval] Evaluation completed for step_{sft_step}=====================")
+                # logging.info(f"[eval] Evaluation completed for step_{sft_step}=====================")
         
         logging.info(f"[train] finish train steps:{train_config.n_sft_steps}, save model.....")
         save_model_and_tokenizer(model, tokenizer, train_config, f"train_samples_{train_config.num_train_samples}")
@@ -566,6 +547,13 @@ def main(
     train_config.micro_batch_size = micro_batch_size
     train_config.sft_train_batch_size = train_batch_size
     train_config.gradient_accumulation_steps = train_batch_size // micro_batch_size
+    train_config.use_correct_samples = use_correct
+    if use_correct:
+        train_config.train_data_path = os.path.join(PROJECT_DIR, "data/gsm8k/train_correct.jsonl")
+
+    print_rich_dict({"train config": asdict(train_config), 
+                    "eval config": asdict(eval_config)})
+
     logging.info(f"[train_config reset] TrainConfig local_model_path: {train_config.local_model_path},"
                 f" train_data_path: {train_config.train_data_path}, "
                 f" sft_train_batch_size: {train_config.sft_train_batch_size}, "
@@ -574,11 +562,15 @@ def main(
                 f" n_sft_step: {train_config.n_sft_steps}")
     
     # 基于本地已经下载好的模型路径加载vLLM模型
-    vllm = init_vllm(model_id=local_model_path, device=train_config.eval_device, seed=seed, gpu_memory_utilization=0.9)
-    logging.info(f"init_vllm with model_id: {local_model_path}, device: {train_config.eval_device}, seed: {seed}, gpu_memory_utilization: 0.9")
+    vllm = init_vllm(model_id=train_config.local_model_path, device=train_config.eval_device, seed=seed, gpu_memory_utilization=0.9)
+    logging.info(f"init_vllm with model_id: {train_config.local_model_path},"
+                f" device: {train_config.eval_device}, seed: {seed}, gpu_memory_utilization: 0.9")
 
     prompts, cot, answers = load_and_format_prompts(train_config.train_data_path, train_config.prompt_path)
-    logging.info(f"load train data from {train_config.train_data_path}, dataset size: {len(prompts)}")
+    logging.info(f"load train data from {train_config.train_data_path}, "
+                 f" use_correct_samples:{train_config.use_correct_samples},"
+                 f" dataset size: {len(prompts)}")
+    total_train_samples = len(prompts)
     for train_sample_num in train_samples:
         # ---------------------
         # Load Model and tokenizer
@@ -591,20 +583,25 @@ def main(
         ).to(train_config.train_device)
 
         tokenizer = AutoTokenizer.from_pretrained(train_config.local_model_path)
-        logging.info(f"[train] Tokenizer {train_config.model_name} loaded from {train_config.local_model_path}")
-        logging.info(f"[train] Model {train_config.model_name} loaded on device: {train_config.train_device},"
+        logging.info(f"[train] Model {train_config.model_name} and Tokenizer loaded on device: {train_config.train_device},"
                 f" will eval on device:{train_config.eval_device}"
                 f" from {train_config.local_model_path}")
 
-        train_config.num_train_samples = train_sample_num
-        train_config.use_correct_samples = use_correct
-
+        train_samples_cnt = min(train_sample_num, total_train_samples)
+        train_config.num_train_samples = train_samples_cnt
+        logging.info(f"[train sft] training for {train_samples_cnt} samples, "
+                         f", param_setting sample_num: {train_sample_num}"
+                         f", total_train_samples: {total_train_samples}")
         # 只使用指定数量的样本进行训练
-        train_prompts = prompts[:train_sample_num]
-        train_cot = cot[:train_sample_num]
-        train_answers = answers[:train_sample_num]
-        logging.info(f"[train sft] training for {train_sample_num} samples")
+        random_indices = random.sample(range(len(prompts)), k=sample_num)
+        train_prompts = [prompts[i] for i in random_indices]
+        train_cot = [cot[i] for i in random_indices]
+        train_answers = [answers[i] for i in random_indices]
 
+        # train_prompts = prompts[:train_samples_cnt]
+        # train_cot = cot[:train_samples_cnt]
+        # train_answers = answers[:train_samples_cnt]
+        
         train_sft_model(
             model,
             tokenizer,
@@ -626,10 +623,10 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--use_correct", type=bool, default=False, help="use correct train data or not")
     parser.add_argument("--train_samples", type=int, nargs='+',
-                    default=[256, 512, 1024, 7400, 128], help="train_samples num from datasets")
+                    default=[128, 256, 512, 1024, 7400], help="train_samples num from datasets")
     parser.add_argument("--train_batch_size", type=int, default=256, help="train batch size")
     parser.add_argument("--micro_batch_size", type=int, default=8, help="micro batch size")
-    parser.add_argument("--n_sft_steps", type=int, default=144, help="n_sft_steps")
+    parser.add_argument("--n_sft_steps", type=int, default=256, help="n_sft_steps")
     args = parser.parse_args()
     if args.train_samples:
         test_train_samples = args.train_samples

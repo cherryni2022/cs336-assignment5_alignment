@@ -494,7 +494,7 @@ def update_policy(
                 avg_token_entropy = masked_mean(entropy, response_mask_micro, dim=None)
                 accumulated_token_entropy += avg_token_entropy.item()
                 # TODO: loss_type = grpo_clip
-                accumulated_clip_fraction += masked_mean(metadata["cliped"], response_mask_micro, dim=None).item()
+                #accumulated_clip_fraction += masked_mean(metadata["cliped"], response_mask_micro, dim=None).item()
                 batch_loss += loss.item()
 
             if train_microstep == train_config.gradient_accumulation_steps - 1:

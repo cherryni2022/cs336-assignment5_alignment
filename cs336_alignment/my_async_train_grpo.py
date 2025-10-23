@@ -232,7 +232,7 @@ def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue,
             project="cs336-grpo",
             group=group_name,
             job_type="eval",
-            name=f"train_grpo_lr{train_config.learning_rate}_{train_config.loss_type}_{policy_type}_{date_str}",
+            name=f"eval_grpo_lr{train_config.learning_rate}_{train_config.loss_type}_{policy_type}_{date_str}",
             config={
                 "n_grpo_steps": train_config.n_grpo_steps,
                 "grpo_learning_rate": train_config.learning_rate,
@@ -552,7 +552,7 @@ def train_grpo(
         project="cs336-grpo",
         group=group_name,
         job_type="train",
-        name=f"train_grpo_lr{train_config.learning_rate}_{train_config.loss_type}_{policy_type}_{date_str}",
+        name=f"grpo_lr{train_config.learning_rate}_{train_config.loss_type}_{policy_type}_{date_str}",
         config={
             "n_grpo_steps": train_config.n_grpo_steps,
             "grpo_learning_rate": train_config.learning_rate,
