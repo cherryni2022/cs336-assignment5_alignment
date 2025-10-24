@@ -3,7 +3,7 @@ import math
 import os
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-from typing import Callable, List
+from typing import Callable, List, Optional
 import dotenv
 import fire
 import time
@@ -16,7 +16,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 import gc
 from dataclasses import asdict, dataclass, field
-#from cs336_alignment.utils import print_color, print_rich_dict, save_model_and_tokenizer
+from concurrent.futures import ThreadPoolExecutor, Future
+from cs336_alignment.grpo import masked_mean
 from cs336_alignment.data_utils import extract_reference_answer, load_and_format_prompts
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.evaluate import get_vllm_response
@@ -85,7 +86,7 @@ class TrainEIConfig:
     gradient_accumulation_steps: int = 32
     micro_batch_size: int = 8
     mixed_precision_training: bool = True
-    learning_rate: float = 1e-5 # 2e-5
+    learning_rate: float = 2e-5 # 2e-5
     betas: tuple[float, float] = (0.9, 0.98)
     train_device: str = "cuda:0"
 
@@ -99,7 +100,10 @@ class TrainEIConfig:
     log_print_steps: int = 12
 
     eval_device: str = "cuda:1"
-    eval_interval_steps: int = 16
+    eval_steps: int = 2
+    rollout_gpu_mem_util: float = 0.45
+    eval_gpu_mem_util: float = 0.45
+    vllm_seed: int = 43
 
     # Learning Rate adjust
     lr_mode: str = "global"  # one of: "global", "per_outer", "constant"
@@ -123,9 +127,101 @@ class EvaluateConfig:
     temperature: float = 1.0
     top_p: float = 1.0
     #stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
-    stop_tokens: list[str] = ["</answer>"]
+    stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
     max_tokens: int = 1024
     include_stop_str_in_output: bool = True
+
+def _load_weights_from_state_dict(llm, cpu_state_dict: dict, device: str):
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    llm_model.load_weights(cpu_state_dict.items())
+    torch.cuda.synchronize(torch.device(device))
+
+def save_model_state_dict(model: AutoModelForCausalLM):
+    #手动保存到cpu state_dict
+    model.eval()
+    model.tie_weights()
+    cpu_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    model.train()
+    return cpu_state_dict
+
+# async evaluate
+def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue, 
+                eval_cfg: EvaluateConfig, 
+                train_config: TrainEIConfig, 
+                group_name: str):
+    logging.basicConfig(format="%(asctime)s - eval - %(levelname)s - %(message)s", level=logging.INFO)
+    # Initialize wandb for the eval subprocess to enable wandb.log inside evaluate_sft_model
+    try:
+        api_key = os.getenv("WANDB_API_KEY")
+        if api_key:
+            wandb.login(key=api_key)
+            logging.info("[eval-worker] wandb.login succeeded via WANDB_API_KEY")
+        wandb_entity = os.getenv("WANDB_ENTITY")
+        date_str = time.strftime("%m%d-%H%M%S")
+        lr = train_config.learning_rate
+        wandb.init(
+            entity=wandb_entity,
+            project="cs336-alignment-ei",
+            group=group_name,
+            job_type="eval",
+            name=f"ei_d{train_config.sample_questions_per_ei_step}_g{train_config.rollout_per_prompt}_e{train_config.sft_train_epochs}_{lr}_{date_str}",
+            config = {
+                "learning_rate": train_config.learning_rate,
+                "sample_questions_per_ei_step": train_config.sample_questions_per_ei_step,
+                "rollout_per_prompt": train_config.rollout_per_prompt,
+                "sft_train_epochs": train_config.sft_train_epochs, 
+                "sft_train_batch_size": train_config.sft_train_batch_size,
+                "micro_batch_size": train_config.micro_batch_size,
+                "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+            }
+            tags=[train_config.experiment_name,
+                   train_config.sample_questions_per_ei_step,
+                   train_config.rollout_per_prompt,
+                   train_config.sft_train_epochs,
+                   train_config.sft_train_batch_size,
+                   train_config.micro_batch_size,
+                   train_config.gradient_accumulation_steps,
+            ]
+        )
+        
+        wandb.define_metric("eval_step")
+        wandb.define_metric("eval/*", step_metric="eval_step")
+        logging.info("[eval-worker] wandb initialized for evaluation logging")
+    except Exception as e:
+        logging.warning(f"[eval-worker] wandb init failed: {e}. Proceeding without wandb.")
+    llm = init_vllm(model_id=train_config.local_model_path, 
+                    device=train_config.eval_device, 
+                    seed=train_config.vllm_seed, 
+                    gpu_memory_utilization=train_config.eval_gpu_mem_util)
+    logging.info(f"[eval-worker] vLLM initialized on {train_config.eval_device} with mem_util={train_config.eval_gpu_mem_util}")
+
+    while True:
+        cmd = cmd_q.get()
+        if cmd is None:
+            continue
+        ctype = cmd.get("type")
+        if ctype == "shutdown":
+            logging.info("[eval-worker] shutdown received")
+            try:
+                wandb.finish()
+            except Exception:
+                pass
+            break
+        elif ctype == "update_weights":
+            cpu_sd = cmd.get("state_dict")
+            _load_weights_from_state_dict(llm, cpu_sd, train_config.eval_device)
+            res_q.put({"type": "ack", "op": "update_weights"})
+        elif ctype == "evaluate":
+            step: int = cmd.get("step", 0)
+            logging.info(f"[eval-worker] evaluate received step={step}")
+            try:
+                evaluate_sft_model(eval_cfg, llm, eval_step=step)
+            except Exception as e:
+                logging.exception(f"[eval-worker] evaluation failed at step {step}: {e}")
+            logging.info(f"[eval-worker] evaluation completed for step_{step}=====================")
+            res_q.put({"type": "evaluate_result", "step": step})
+        else:
+            logging.warning(f"[eval-worker] unknown cmd: {ctype}")
 
 class AsyncEvaluator:
     def __init__(self, eval_config: EvaluateConfig, vllm: LLM):
@@ -267,6 +363,8 @@ def train_sft_model(
     train_prompts,
     train_cot,
     train_answers,
+    eval_cmd_q,
+    eval_res_q,
     global_sft_step: int,  #全局sft训练的steps累积轮次
     curr_ei_steps: int,  # ei训练的当前step轮次
     ):
@@ -298,11 +396,12 @@ def train_sft_model(
     # step4:训练模型
     total_loss = 0 # 累计每个sft step的loss
     n_sft_steps = total_train_ds_samples * train_config.sft_train_epochs // (train_config.sft_train_batch_size) + 1
-    logging.info(f"[trainSFT | ei step_{curr_ei_steps}] Start sft training, "
-                 f"from global sft step_{global_sft_step}, will run sft steps: {n_sft_steps},"
+    logging.info(f"[trainSFT | ei step_{curr_ei_steps+1}] Start sft training, "
+                 f"from global sft step_{global_sft_step+1}, will run sft steps: {n_sft_steps},"
                  f"total_train_ds_samples: {total_train_ds_samples},"
-                 f"sft_train_epochs: {train_config.sft_train_epochs},")
-    for sft_step in range(n_sft_steps):
+                 f"sft_train_epochs: {train_config.sft_train_epochs},"
+                 f"n_sft_steps: {n_sft_steps}")
+    for sft_step in range(train_config.sft_train_epochs):
         batch_loss = 0
         accumulated_token_entropy = 0
         #logging.info(f"[trainSFT | ei step_{curr_ei_steps}] sft global step_{global_sft_step}, sft local step_{sft_step}")
@@ -317,7 +416,6 @@ def train_sft_model(
             with ctx:
                 log_prob_response = get_response_log_probs(model=model, 
                                     input_ids=input_ids, labels=labels, 
-                                    response_mask=response_mask,
                                     return_token_entropy=True)
                 log_prob = log_prob_response["log_probs"]
                 entropy = log_prob_response["token_entropy"]
@@ -325,11 +423,11 @@ def train_sft_model(
                 loss, _ = sft_microbatch_train_step(
                     log_prob, response_mask, train_config.gradient_accumulation_steps
                 )
-                avg_token_entropy = masked_mean(entropy, response_mask_micro, dim=None)
+                avg_token_entropy = masked_mean(entropy, response_mask, dim=None)
                 accumulated_token_entropy += avg_token_entropy.item()
                 batch_loss += loss
-                logging.info(f"[train test log] ei step_{curr_ei_steps} sft global step_{global_sft_step} |"
-                        f"local sft step_{sft_step} | "
+                logging.info(f"[train test log] ei step_{curr_ei_steps+1} sft global step_{global_sft_step+1} |"
+                        f"local sft step_{sft_step+1} | "
                         f"Gradient accumulation step_{curr_grad_accum_step} | "
                         f"response_mask_entropy: {entropy[response_mask].mean().item():.6f} |"
                         f"Global Entropy: {entropy.mean().item():.6f} |"
@@ -377,20 +475,29 @@ def train_sft_model(
 
         global_sft_step += 1
 
+
         if (global_sft_step % train_config.eval_steps == 0):
-            
+            cpu_state_dict = save_model_state_dict(model)
+            logging.info(f"[ei train] sft global step_{global_sft_step} save model state dict to cpu_state_dict....")
             # evaluate model & wandb.log 信息
             logging.info(
-                f"[trainSFT | ei step_{curr_ei_steps} sft_global step_{global_sft_step}]: "
+                f"[ei train | ei step_{curr_ei_steps+1} sft_global step_{global_sft_step}]: "
                 f"saving model at {train_config.experiment_name}/ei_rollout_samples_{train_config.sample_questions_per_ei_step}"
             )
+            # save model&tokenizer every eval_step
             save_model_and_tokenizer(model, tokenizer, train_config, f"ei_rollout_samples_{train_config.sample_questions_per_ei_step}")
-            #load_model_into_vllm_instance(model, vllm)
-            #evaluate_sft_model(eval_config, vllm, global_sft_step)
-            eval_future = async_evaluator.start_async_evaluation(model, global_sft_step)
+            #logging.info(f"[grpo async eval] step_{grpo_step+1}: evaluate update_weights....")
+            eval_cmd_q.put({"type": "update_weights", "state_dict": cpu_state_dict})
+            _ = eval_res_q.get()
+            logging.info(f"[ei async eval] ei step_{curr_ei_steps} sft global step_{global_sft_step}: evaluate update_weights finished....")
+
+            logging.info(f"[ei async eval] ei step_{curr_ei_steps} sft global step_{global_sft_step}: dispatch evaluation")
+            # TODO: off_policy训练 epochs_per_rollout_batch > 1, 一轮grpo_step中多次train_step=train_steps_per_rollout_batch
+            eval_cmd_q.put({"type": "evaluate", "step": global_sft_step})
+
             
         
-    return total_loss / train_config.training_steps, global_sft_step
+    return total_loss / train_config.sft_train_epochs, global_sft_step
 
 # 实验要求:
 # 1.改变每个问题的 rollout 数量 G 和 SFT 步骤中使用的 epoch 数量:
@@ -403,7 +510,6 @@ def train_sft_model(
 # 不变: rollout:4, training_steps=8 => sample_questions_per_ei_step [512, 1024, 2048]
 # 不变: sample_questions_per_ei_step=512,train_steps=8 => rollout=4, rollout = 2, rollout=8
 # 不变: sample_questions_per_ei_step=512, rollout=4 => training_steps=8, train_steps=16
-
 def train_ei_model(
     train_config: TrainEIConfig,
     eval_config: EvaluateConfig,
@@ -412,9 +518,12 @@ def train_ei_model(
     # step1: init wandb
     date_str = time.strftime("%m%d-%H%M%S")
     lr = train_config.learning_rate
+    group_name = f"{train_config.experiment_name}"
     wandb.init(
         entity=os.getenv("WANDB_ENTITY"),
         project="cs336-alignment-ei",
+        group=group_name,
+        job_type="train",
         name=f"ei_d{train_config.sample_questions_per_ei_step}_g{train_config.rollout_per_prompt}_e{train_config.sft_train_epochs}_{lr}_{date_str}",
         config = {
             "learning_rate": train_config.learning_rate,
@@ -456,9 +565,31 @@ def train_ei_model(
         include_stop_str_in_output=eval_config.include_stop_str_in_output,
     )
 
-     # 创建异步评估器
-    async_evaluator = AsyncEvaluator(eval_config, vllm)
+    # 创建异步评估器
+    #async_evaluator = AsyncEvaluator(eval_config, vllm)
+    # 深拷贝model权重到CPU，避免持有GPU张量
+    cpu_state_dict = save_model_state_dict(model)
 
+    # 启动子进程vllm for evaluate（device cuda:1）
+    # rollout_cmd_q: mp.Queue = mp.Queue()
+    # rollout_res_q: mp.Queue = mp.Queue()
+    eval_cmd_q: mp.Queue = mp.Queue()
+    eval_res_q: mp.Queue = mp.Queue()
+
+    eval_p = mp.Process(
+        target=eval_worker,
+        args=(eval_cmd_q, eval_res_q,  
+              eval_config, train_config, group_name),
+        daemon=True,
+    )
+    eval_p.start()
+    logging.info(f"[EI train] evaluate worker started on {train_config.eval_device} with process isolation")
+    # 初次加载训练权重到vLLM(evaluate)实例
+    eval_cmd_q.put({"type": "update_weights", "state_dict": cpu_state_dict})
+    # 等待权重加载完成的确认
+    _ = eval_res_q.get()
+    logging.info("[EI train] weights loaded into vLLM(evaluate) instance")
+        
     # prepare data loader
     base_ds = ExpertTrainDataSet(train_config.train_data_path, train_config.prompt_path)
     base_data_loader = DataLoader(
@@ -510,8 +641,10 @@ def train_ei_model(
             train_prompts = correct_prompts,
             train_cot = correct_outputs,
             train_answers = correct_answers,  # not used in SFT
-            global_step = global_step,
-            ei_steps = ei_step,
+            eval_cmd_q = eval_cmd_q,
+            eval_res_q = eval_res_q,
+            global_sft_step = global_step,
+            curr_ei_steps = ei_step,
         )
 
         print_color(f"[EI train] Step_{ei_step} | Correct samples: {len(correct_prompts)} | Globel sft step: {global_step} Loss: {loss:.4f}", color="green")
@@ -520,8 +653,8 @@ def train_ei_model(
         # 一次sft训练结束, eval_model= model, 后一次ei_step基于eval_model对抽样数据采集outputs
         load_model_into_vllm_instance(model, vllm)
     
-    # TODO: save path
-    save_model_and_tokenizer(model, tokenizer, train_config, f"final_step_{global_step}")
+    
+    save_model_and_tokenizer(model, tokenizer, train_config,  f"ei_rollout_samples_{train_config.sample_questions_per_ei_step}")
     wandb.finish()
 
     return model
