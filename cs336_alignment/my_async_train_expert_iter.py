@@ -304,6 +304,7 @@ def train_sft_model(
                  f"sft_train_epochs: {train_config.sft_train_epochs},")
     for sft_step in range(n_sft_steps):
         batch_loss = 0
+        accumulated_token_entropy = 0
         #logging.info(f"[trainSFT | ei step_{curr_ei_steps}] sft global step_{global_sft_step}, sft local step_{sft_step}")
         for curr_grad_accum_step in range(train_config.gradient_accumulation_steps):
             # 从dataloader中获取一个micro batch的训练数据
@@ -324,6 +325,9 @@ def train_sft_model(
                 loss, _ = sft_microbatch_train_step(
                     log_prob, response_mask, train_config.gradient_accumulation_steps
                 )
+                avg_token_entropy = masked_mean(entropy, response_mask_micro, dim=None)
+                accumulated_token_entropy += avg_token_entropy.item()
+                batch_loss += loss
                 logging.info(f"[train test log] ei step_{curr_ei_steps} sft global step_{global_sft_step} |"
                         f"local sft step_{sft_step} | "
                         f"Gradient accumulation step_{curr_grad_accum_step} | "
@@ -332,7 +336,7 @@ def train_sft_model(
                         f"Prompt Entropy: {entropy[~response_mask].mean().item():.6f} |"
                         f"Loss: {loss.item():.4f}")
 
-            batch_loss += loss
+                
 
             # 累积梯度更新参数
             if curr_grad_accum_step == train_config.gradient_accumulation_steps - 1:
@@ -352,19 +356,21 @@ def train_sft_model(
                     f"[trainSFT | ei step_{curr_ei_steps} sft_global step_{global_sft_step+1}]: "
                     f" | local sft step_{sft_step}"
                     f" | avg_loss: {avg_loss:.4f}"
-                    f" | response_mask_entropy: {entropy[response_mask].mean().item():.6f}"
+                    f" | avg_response_entropy: {accumulated_token_entropy / train_config.gradient_accumulation_steps:.4f}"
+                    f" | response_entropy: {entropy[response_mask].mean().item():.6f}"
                     f" | Global Entropy: {entropy.mean().item():.6f}"
-                    f" | Prompt Entropy: {entropy[~response_mask].mean().item():.6f}"
+                    # f" | Prompt Entropy: {entropy[~response_mask].mean().item():.6f}"
                     f" | adj_lr: {adj_lr:.6f}"
                 )
 
                 wandb.log(
                     {
                         "train_step": global_sft_step+1,
-                        "train/loss": avg_loss,
+                        "train/avg_loss": avg_loss,
+                        "train/batch_loss": batch_loss,
+                        "train/avg_response_entropy": accumulated_token_entropy / train_config.gradient_accumulation_steps,
                         "train/response_entropy": to_float(entropy[response_mask].mean()),
                         "train/entropy": to_float(entropy.mean()),
-                        "train/prompt_entropy": to_float(entropy[~response_mask].mean()),
                         "train/lr": adj_lr,
                     }
                 )
