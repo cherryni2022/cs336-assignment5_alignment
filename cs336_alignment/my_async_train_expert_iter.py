@@ -77,10 +77,10 @@ class TrainEIConfig:
     train_data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/train.jsonl")
     prompt_path: str = os.path.join(PROJECT_DIR, "cs336_alignment/prompts/r1_zero.prompt")
 
-    # 控制每轮ei 的sft train 的参数变量
+    # 控制每轮ei,sft train dataset的epochs
     sft_train_epochs: int = 8
     # sft_training_steps 每次基于sft_train_epochs计算
-    # sft_training_steps: int = 8 
+    sft_training_steps: int = 8 
     sft_train_batch_size: int = 256
     gradient_accumulation_steps: int = 32
     micro_batch_size: int = 8
@@ -111,8 +111,8 @@ class TrainEIConfig:
     ei_temperature: float = 1.0
     ei_top_p: float = 1.0
     ei_max_tokens: int = 1024
-    #ei_stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
-    ei_stop_tokens: list[str] = ["</answer>"]
+    ei_stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
+    #ei_stop_tokens: list[str] = ["</answer>"]
     ei_include_stop_str_in_output: bool = True
     ei_min_tokens: int = 4
 
@@ -267,8 +267,8 @@ def train_sft_model(
     train_prompts,
     train_cot,
     train_answers,
-    global_sft_step: int = 0,  #全局sft训练的steps累积轮次
-    curr_ei_steps: int = 0,  # ei训练的当前step轮次
+    global_sft_step: int,  #全局sft训练的steps累积轮次
+    curr_ei_steps: int,  # ei训练的当前step轮次
     ):
 
     # step1: 准备训练数据
@@ -297,7 +297,7 @@ def train_sft_model(
 
     # step4:训练模型
     total_loss = 0 # 累计每个sft step的loss
-    n_sft_steps = total_train_ds_samples * train_config.sft_train_epochs // (train_config.gradient_accumulation_steps * train_config.micro_batch_size) + 1
+    n_sft_steps = total_train_ds_samples * train_config.sft_train_epochs // (train_config.sft_train_batch_size) + 1
     logging.info(f"[trainSFT | ei step_{curr_ei_steps}] Start sft training, "
                  f"from global sft step_{global_sft_step}, will run sft steps: {n_sft_steps},"
                  f"total_train_ds_samples: {total_train_ds_samples},"
@@ -324,7 +324,7 @@ def train_sft_model(
                 loss, _ = sft_microbatch_train_step(
                     log_prob, response_mask, train_config.gradient_accumulation_steps
                 )
-                logging.info(f"[train test log] ei step_{curr_ei_steps}] sft global step_{global_sft_step} |"
+                logging.info(f"[train test log] ei step_{curr_ei_steps} sft global step_{global_sft_step} |"
                         f"local sft step_{sft_step} | "
                         f"Gradient accumulation step_{curr_grad_accum_step} | "
                         f"response_mask_entropy: {entropy[response_mask].mean().item():.6f} |"
@@ -334,17 +334,11 @@ def train_sft_model(
 
             batch_loss += loss
 
-            # TODO 
-            del input_ids
-            del labels
-            clear()
-
             # 累积梯度更新参数
             if curr_grad_accum_step == train_config.gradient_accumulation_steps - 1:
                 # 梯度裁剪
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 # TODO 是否考虑 ei_step, sft_step
-                #adj_lr = get_lr(sft_step, train_config.learning_rate, train_config.training_steps)
                 adj_lr = get_lr(curr_ei_steps, train_config.learning_rate, train_config.n_ei_steps)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = adj_lr
@@ -367,7 +361,6 @@ def train_sft_model(
                 wandb.log(
                     {
                         "train_step": global_sft_step+1,
-                        #"train/ei_step": curr_ei_steps,
                         "train/loss": avg_loss,
                         "train/response_entropy": to_float(entropy[response_mask].mean()),
                         "train/entropy": to_float(entropy.mean()),
@@ -416,8 +409,9 @@ def train_ei_model(
     wandb.init(
         entity=os.getenv("WANDB_ENTITY"),
         project="cs336-alignment-ei",
-        name=f"train_ei_{train_config.sample_questions_per_ei_step}_{train_config.rollout_per_prompt}_{train_config.sft_train_epochs}_{lr}_{date_str}",
+        name=f"ei_d{train_config.sample_questions_per_ei_step}_g{train_config.rollout_per_prompt}_e{train_config.sft_train_epochs}_{lr}_{date_str}",
         config = {
+            "learning_rate": train_config.learning_rate,
             "sample_questions_per_ei_step": train_config.sample_questions_per_ei_step,
             "rollout_per_prompt": train_config.rollout_per_prompt,
             "sft_train_epochs": train_config.sft_train_epochs, 
@@ -444,11 +438,9 @@ def train_ei_model(
     ).to(train_config.train_device)
     tokenizer = AutoTokenizer.from_pretrained(train_config.local_model_path)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate, betas=train_config.betas)
-    print(f"[EI train] Tokenizer {train_config.model_name} loaded from {train_config.local_model_path}")
-    print(f"[EI train] Model {train_config.model_name} loaded on device: {train_config.train_device},"
+    logging.info(f"[EI train] Model {train_config.model_name} loaded on device: {train_config.train_device},"
             f" will eval on device:{train_config.eval_device}"
             f", from {train_config.local_model_path}")
-    print(f"[EI train] Optimizer loaded, with learning rate: {train_config.learning_rate}")
 
     eval_sample_params = SamplingParams(
         temperature=eval_config.temperature,
@@ -475,10 +467,10 @@ def train_ei_model(
     # Expert_Iterator Training loop
     for ei_step in range(train_config.n_ei_steps):
         # Sample a batch of questions Db from D
-        batch_samples = next(iter(ei_train_dataloader))
-        batch_prompts = batch_samples[0]
-        batch_answers = batch_samples[2]
-        print(f"[EI train] Step)_{ei_step}: Sample {len(batch_prompts)} questions from D")
+        batch_prompts, batch_cots, batch_answers = next(iter(ei_train_dataloader))
+        # batch_prompts = batch_samples[0]
+        # batch_answers = batch_samples[2]
+        print(f"[EI train] step_{ei_step}: Sample {len(batch_prompts)} questions from D")
 
         # 每轮ei迭代训练完已经load model到vllm
         
@@ -492,12 +484,12 @@ def train_ei_model(
         )
 
         if len(correct_prompts) == 0:
-            logging.info(f"[EI train] Step {ei_step}: no correct generations; skipping SFT update.")
+            logging.info(f"[EI train] step_{ei_step}: no correct generations; skipping SFT update.")
             continue
         
         # print 采样的数据样例
-        print_color(f"[EI train] Step_{ei_step}: Collect {len(correct_prompts)} correct sample output data")
-        print_color(f"[EI train] Example correct sample data:"
+        logging.info(f"[EI train] step_{ei_step}: collect {len(correct_prompts)} correct sample output data")
+        logging.info(f"[EI train] example correct sample data:"
                     f"correct_prompts: {correct_prompts[0]}"
                     f"correct_outputs: {correct_outputs[0]}"
                     f"correct_answers: {correct_answers[0]}")
@@ -519,7 +511,7 @@ def train_ei_model(
         print_color(f"[EI train] Step_{ei_step} | Correct samples: {len(correct_prompts)} | Globel sft step: {global_step} Loss: {loss:.4f}", color="green")
 
         logging.info(f"Loaded weights to vllm at step_{ei_step}")
-        # 一次sft训练结束, eval_model= model, 后一次ei_step 将利用eval_model对抽样数据采集outputs
+        # 一次sft训练结束, eval_model= model, 后一次ei_step基于eval_model对抽样数据采集outputs
         load_model_into_vllm_instance(model, vllm)
     
     # TODO: save path
@@ -536,7 +528,7 @@ def train_ei_model(
 # 不变: sample_questions_per_ei_step=512,train_steps=8 => rollout=4, rollout = 2, rollout=8
 # 不变: sample_questions_per_ei_step=512, rollout=4 => training_steps=8, train_steps=16
 def main(*,
-    sample_questions_per_ei_step_params: list[int] = [512],
+    sample_questions_per_ei_step: int = 512,
     rollout_per_prompt: int = 4,
     sft_train_epochs: int = 8,
     sft_train_batch_size: int = 256,
@@ -566,69 +558,61 @@ def main(*,
     logging.info(f"[train] wandb login with key: {api_key}")
     
     # set train_config
+    train_config.sample_questions_per_ei_step = sample_questions_per_ei_step
     train_config.rollout_per_prompt = rollout_per_prompt
     train_config.sft_train_epochs = sft_train_epochs
     train_config.sft_train_batch_size = sft_train_batch_size
     train_config.micro_batch_size = micro_batch_size
     train_config.gradient_accumulation_steps = sft_train_batch_size // micro_batch_size
-    logging.info(f"[train_config reset] TrainConfig local_model_path: {train_config.local_model_path},"
-                    f" train_data_path: {train_config.train_data_path}, "
-                    f" sft_train_batch_size: {train_config.sft_train_batch_size}, "
-                    f" gradient_accumulation_steps: {train_config.gradient_accumulation_steps}, "
-                    f" micro_batch_size: {train_config.micro_batch_size}, "
-                    f" sft_train_epochs: {train_config.sft_train_epochs}")
+
+    print_rich_dict({"train config": asdict(train_config), 
+                    "eval config": asdict(eval_config)})
     
-    for sample_questions_per_ei_step in sample_questions_per_ei_step_params:
-        # TODO: set config and log
-        train_config.sample_questions_per_ei_step = sample_questions_per_ei_step
-        logging.info(f"start train EI for sample_questions_per_ei_step={train_config.sample_questions_per_ei_step}")
-        # 初始化vllm
-        vllm = init_vllm(model_id=local_model_path, device=train_config.eval_device, seed=seed)
-        logging.info(f"init_vllm with model_id: {local_model_path}, device: {train_config.eval_device}, seed: {seed}, gpu_memory_utilization: 0.9")
-        
-        train_ei_model(
-            train_config,
-            eval_config=eval_config,
-            vllm=vllm,
-        )
+    # 初始化vllm
+    vllm = init_vllm(model_id=local_model_path, device=train_config.eval_device, seed=seed)
+    logging.info(f"init_vllm with model_id: {local_model_path}, device: {train_config.eval_device}, seed: {seed}, gpu_memory_utilization: 0.9")
+    
+    train_ei_model(
+        train_config=train_config,
+        eval_config=eval_config,
+        vllm=vllm,
+    )
 
     wandb.finish()
     print(f"finish EI train")
 
 # 控制变量:
 # train_config.sample_questions_per_ei_step (每个专家迭代步骤的批量大小（即 Db 的大小))
+# # [512, 1024, 2048]
 # train_config.rollout_per_prompt (每个问题的 rollout 数量 G)
-# train_config.training_steps (SFT 步骤中使用的 epoch 数量)
+# train_config.sft_train_epochs (SFT train dataset epochs)
 # 不变: rollout:4, training_steps=8 => sample_questions_per_ei_step [512, 1024, 2048]
 # 不变: sample_questions_per_ei_step=512,train_steps=8 => rollout=4, rollout = 2, rollout=8
 # 不变: sample_questions_per_ei_step=512, rollout=4 => training_steps=8, train_steps=16
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--sample_questions_per_ei_step", type=int,  nargs='+',
-                    default=[512, 1024, 2048], help="sample_questions_per_ei_step")
+    parser.add_argument("--sample_questions_per_ei_step", type=int,
+                    default=512, help="sample_questions_per_ei_step")
     parser.add_argument("--rollout_per_prompt", type=int, default=4, help="rollout_per_prompt")
-    parser.add_argument("--sft_train_epochs", type=int, default=10, help="sft train epochs")
+    parser.add_argument("--sft_train_epochs", type=int, default=8, help="sft train epochs")
     parser.add_argument("--sft_train_batch_size", type=int, default=256, help="sft train batch size")
     parser.add_argument("--micro_batch_size", type=int, default=8, help="micro batch size")
-    args = parser.parse_args()
-    test_sample_questions_per_ei_step = args.sample_questions_per_ei_step
-    test_rollout_per_prompt = args.rollout_per_prompt
-    test_sft_train_epochs = args.sft_train_epochs
+    args = parser.parse_args()    
 
     print(f"Start train EI for "
-        f"sample_questions_per_ei_step={test_sample_questions_per_ei_step}, "
-        f"rollout_per_prompt={test_rollout_per_prompt}, "
-        f"sft_train_epochs={test_sft_train_epochs}",
+        f"sample_questions_per_ei_step={args.sample_questions_per_ei_step}, "
+        f"rollout_per_prompt={args.rollout_per_prompt}, "
+        f"sft_train_epochs={args.sft_train_epochs}",
         f"sft_train_batch_size={args.sft_train_batch_size}",
         f"micro_batch_size={args.micro_batch_size}")
     
-    fire.Fire(main(sample_questions_per_ei_step_params=test_sample_questions_per_ei_step,
-                 rollout_per_prompt=test_rollout_per_prompt,
-                sft_train_epochs=test_sft_train_epochs,
+    fire.Fire(main(sample_questions_per_ei_step=args.sample_questions_per_ei_step,
+                 rollout_per_prompt=args.rollout_per_prompt,
+                sft_train_epochs=args.sft_train_epochs,
                 sft_train_batch_size=args.sft_train_batch_size,
                 micro_batch_size=args.micro_batch_size))
     
     print(f"Finish train EI for "
-        f"sample_questions_per_ei_step={test_sample_questions_per_ei_step}, "
-        f"rollout_per_prompt={test_rollout_per_prompt}, "
-        f"sft_train_epochs={test_sft_train_epochs}")
+        f"sample_questions_per_ei_step={args.sample_questions_per_ei_step}, "
+        f"rollout_per_prompt={args.rollout_per_prompt}, "
+        f"sft_train_epochs={args.sft_train_epochs}")

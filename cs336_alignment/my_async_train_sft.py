@@ -553,13 +553,6 @@ def main(
 
     print_rich_dict({"train config": asdict(train_config), 
                     "eval config": asdict(eval_config)})
-
-    logging.info(f"[train_config reset] TrainConfig local_model_path: {train_config.local_model_path},"
-                f" train_data_path: {train_config.train_data_path}, "
-                f" sft_train_batch_size: {train_config.sft_train_batch_size}, "
-                f" gradient_accumulation_steps: {train_config.gradient_accumulation_steps}, "
-                f" micro_batch_size: {train_config.micro_batch_size}, "
-                f" n_sft_step: {train_config.n_sft_steps}")
     
     # 基于本地已经下载好的模型路径加载vLLM模型
     vllm = init_vllm(model_id=train_config.local_model_path, device=train_config.eval_device, seed=seed, gpu_memory_utilization=0.9)
@@ -593,7 +586,7 @@ def main(
                          f", param_setting sample_num: {train_sample_num}"
                          f", total_train_samples: {total_train_samples}")
         # 只使用指定数量的样本进行训练
-        random_indices = random.sample(range(len(prompts)), k=sample_num)
+        random_indices = random.sample(range(len(prompts)), k=train_samples_cnt)
         train_prompts = [prompts[i] for i in random_indices]
         train_cot = [cot[i] for i in random_indices]
         train_answers = [answers[i] for i in random_indices]
