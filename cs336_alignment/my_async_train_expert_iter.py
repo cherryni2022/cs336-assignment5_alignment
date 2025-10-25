@@ -220,65 +220,6 @@ def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue,
         else:
             logging.warning(f"[eval-worker] unknown cmd: {ctype}")
 
-class AsyncEvaluator:
-    def __init__(self, eval_config: EvaluateConfig, vllm: LLM):
-        self.eval_config = eval_config
-        self.vllm = vllm
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eval")
-        self.current_eval_future: Optional[Future] = None
-        
-    def start_async_evaluation(self, model: torch.nn.Module, eval_step: int) -> Future:
-        """异步启动评估任务"""
-        # 等待上一个评估完成
-        if self.current_eval_future and not self.current_eval_future.done():
-            logging.warning(f"Previous evaluation still running, waiting...")
-            self.current_eval_future.result()  # 阻塞等待完成
-            
-        # 创建模型权重的深拷贝到CPU
-        model.eval()
-        model.tie_weights()
-        cpu_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        model.train()
-        
-        # 提交异步评估任务
-        self.current_eval_future = self.executor.submit(
-            self._evaluate_async, cpu_state_dict, eval_step
-        )
-        return self.current_eval_future
-        
-    def _evaluate_async(self, cpu_state_dict: dict, eval_step: int):
-        """异步评估的实际执行函数"""
-        try:
-            logging.info(f"[async_eval] Starting evaluation for step {eval_step}")
-            
-            # 加载权重到vLLM实例
-            llm_model = self.vllm.llm_engine.model_executor.driver_worker.model_runner.model
-            llm_model.load_weights(cpu_state_dict.items())
-            torch.cuda.synchronize(torch.device("cuda:1"))
-            
-            # 执行评估
-            evaluate_sft_model(self.eval_config, self.vllm, eval_step=eval_step)
-            
-            logging.info(f"[async_eval] Evaluation completed for step {eval_step}")
-            
-        except Exception as e:
-            logging.error(f"[async_eval] Evaluation failed for step {eval_step}: {e}")
-            raise
-        finally:
-            # 清理CPU内存
-            del cpu_state_dict
-            torch.cuda.empty_cache()
-            
-    def wait_for_completion(self):
-        """等待当前评估完成"""
-        if self.current_eval_future:
-            self.current_eval_future.result()
-            
-    def shutdown(self):
-        """关闭异步评估器"""
-        self.wait_for_completion()
-        self.executor.shutdown(wait=True)
-
 # train.jsonl全量数据集,用于每轮专家迭代步骤中采样Db question
 class ExpertTrainDataSet(Dataset):
     def __init__(self, data_path: str, prompt_path: str):
@@ -297,32 +238,24 @@ class ExpertTrainDataSet(Dataset):
         return prompt, cot, answer
 
 class SFTDataset(Dataset):
-    def __init__(self, train_prompts, train_cot, train_answers):
-        self.train_prompts = train_prompts
-        self.train_cot = train_cot
-        self.train_answers = train_answers
+    def __init__(self, prompts, cot, answers):
+        self.prompts = prompts
+        self.cots = cot
+        self.answers = answers
         # Encode prompts and responses
-        encoded = tokenize_prompt_and_output(prompts, responses, tokenizer)
-        self.input_ids = encoded["input_ids"]
-        self.labels = encoded["labels"]
-        self.response_mask = encoded["response_mask"]
-        logging.info(f"[SFTDataset] init generate SFT Dataset Done, "
-                    f"input_ids.len={len(self.input_ids)},"
-                    f"labels.len={len(self.labels)},"
-                    f"response_mask.len={len(self.response_mask)},"
-        # self.input_ids = input_ids
-        # self.labels = labels
-        # self.response_mask = response_mask
+        # encoded = tokenize_prompt_and_output(prompts, cot, tokenizer)
+        # self.input_ids = encoded["input_ids"]
+        # self.labels = encoded["labels"]
+        # self.response_mask = encoded["response_mask"]
 
     def __len__(self):
-        return len(self.input_ids)
+        return len(self.prompts)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        input_ids = self.input_ids[idx]
-        labels = self.labels[idx]
-        response_mask = self.response_mask[idx]
-
-        return input_ids, labels, response_mask
+    def __getitem__(self, index):
+        prompt = self.prompts[index]
+        cot = self.cots[index]
+        answer = to_float(self.answers[index])
+        return prompt, cot, answer
 
 # 用于每次专家迭代步骤中，收集所有 reward==1 的 (prompt, output) 对
 @torch.no_grad()
@@ -366,12 +299,12 @@ def train_sft_model(
     model,
     optimizer,
     tokenizer,
+    vllm,
     train_config: TrainEIConfig,
+    eval_config,
     train_prompts,
     train_cot,
     train_answers,
-    eval_cmd_q,
-    eval_res_q,
     global_sft_step: int,  #全局sft训练的steps累积轮次
     curr_ei_steps: int,  # ei训练的当前step轮次
     ):
@@ -385,9 +318,10 @@ def train_sft_model(
         shuffle=True,
         num_workers=4,
         pin_memory=True,
+        collate_fn=lambda batch: sft_collate_fn(batch, tokenizer),
     )
     sft_data_loader = cycle_dataloader(train_dataloader)
-    logging.info(f"[trainSFT | ei step_{curr_ei_steps}] Dataloader initialized with batch size {train_config.sft_train_batch_size},"
+    logging.info(f"[trainSFT] ei step_{curr_ei_steps+1}] Dataloader initialized with batch size {train_config.sft_train_batch_size},"
           f" micro batch size: {train_config.micro_batch_size}")
     # step3:准备模型训练的optimazer等
     # ---------------------
@@ -402,7 +336,7 @@ def train_sft_model(
     # step4:训练模型
     total_loss = 0 # 累计每个sft step的loss
     n_sft_steps = total_train_ds_samples * train_config.sft_train_epochs // (train_config.sft_train_batch_size) + 1
-    logging.info(f"[trainSFT | ei step_{curr_ei_steps+1}] Start sft training, "
+    logging.info(f"[trainSFT] ei step_{curr_ei_steps+1}] Start sft training, "
                  f"from global sft step_{global_sft_step+1}, will run sft steps: {n_sft_steps},"
                  f"total_train_ds_samples: {total_train_ds_samples},"
                  f"sft_train_epochs: {train_config.sft_train_epochs},"
@@ -413,8 +347,7 @@ def train_sft_model(
         #logging.info(f"[trainSFT | ei step_{curr_ei_steps}] sft global step_{global_sft_step}, sft local step_{sft_step}")
         for curr_grad_accum_step in range(train_config.gradient_accumulation_steps):
             # 从dataloader中获取一个micro batch的训练数据
-            batch = next(iter(sft_data_loader))
-            # sft训练中 ["answers"] 没用,eval时用
+            batch = next(iter(train_dataloader))
             input_ids = batch["input_ids"].to(train_config.train_device)
             labels = batch["labels"].to(train_config.train_device)
             response_mask = batch["response_mask"].to(train_config.train_device)
@@ -482,22 +415,19 @@ def train_sft_model(
         global_sft_step += 1
 
         if (global_sft_step % train_config.eval_steps == 0):
-            cpu_state_dict = save_model_state_dict(model)
-            logging.info(f"[ei train] sft global step_{global_sft_step} save model state dict to cpu_state_dict....")
-            # evaluate model & wandb.log 信息
-            logging.info(
-                f"[ei train | ei step_{curr_ei_steps+1} sft_global step_{global_sft_step}]: "
-                f"saving model at {train_config.experiment_name}/ei_rollout_samples_{train_config.sample_questions_per_ei_step}"
-            )
+            # Run evaluatoin
+            logging.info(f"[eval EI] ei step_{curr_ei_steps+1} sft_global step_{global_sft_step} ==================")
+            load_model_into_vllm_instance(model, vllm)
+            evaluate_sft_model(eval_config, vllm, eval_step=global_sft_step)
+            logging.info(f"[eval EI] Evaluation completed for ei step_{curr_ei_steps} sft_global step_{global_sft_step}=====================")
+
             # save model&tokenizer every eval_step
             save_model_and_tokenizer(model, tokenizer, train_config, f"ei_rollout_samples_{train_config.sample_questions_per_ei_step}")
-            #logging.info(f"[grpo async eval] step_{grpo_step+1}: evaluate update_weights....")
-            eval_cmd_q.put({"type": "update_weights", "state_dict": cpu_state_dict})
-            _ = eval_res_q.get()
-            logging.info(f"[ei async eval] ei step_{curr_ei_steps} sft global step_{global_sft_step}: evaluate update_weights finished....")
-
-            logging.info(f"[ei async eval] ei step_{curr_ei_steps} sft global step_{global_sft_step}: dispatch evaluation")
-            eval_cmd_q.put({"type": "evaluate", "step": global_sft_step})
+            logging.info(
+                f"[trainEI] ei step_{curr_ei_steps+1} sft_global step_{global_sft_step}]: "
+                f"saving model at {train_config.experiment_name}/ei_rollout_samples_{train_config.sample_questions_per_ei_step}"
+            )
+            
 
             
         
@@ -569,31 +499,6 @@ def train_ei_model(
         stop=eval_config.stop_tokens,
         include_stop_str_in_output=eval_config.include_stop_str_in_output,
     )
-
-    # 创建异步评估器
-    #async_evaluator = AsyncEvaluator(eval_config, vllm)
-    # 深拷贝model权重到CPU，避免持有GPU张量
-    cpu_state_dict = save_model_state_dict(model)
-
-    # 启动子进程vllm for evaluate（device cuda:1）
-    # rollout_cmd_q: mp.Queue = mp.Queue()
-    # rollout_res_q: mp.Queue = mp.Queue()
-    eval_cmd_q: mp.Queue = mp.Queue()
-    eval_res_q: mp.Queue = mp.Queue()
-
-    eval_p = mp.Process(
-        target=eval_worker,
-        args=(eval_cmd_q, eval_res_q,  
-              eval_config, train_config, group_name),
-        daemon=True,
-    )
-    eval_p.start()
-    logging.info(f"[EI train] evaluate worker started on {train_config.eval_device} with process isolation")
-    # 初次加载训练权重到vLLM(evaluate)实例
-    eval_cmd_q.put({"type": "update_weights", "state_dict": cpu_state_dict})
-    # 等待权重加载完成的确认
-    _ = eval_res_q.get()
-    logging.info("[EI train] weights loaded into vLLM(evaluate) instance")
         
     # prepare data loader
     base_ds = ExpertTrainDataSet(train_config.train_data_path, train_config.prompt_path)
@@ -614,8 +519,7 @@ def train_ei_model(
         # batch_answers = batch_samples[2]
         print(f"[EI train] step_{ei_step}: Sample {len(batch_prompts)} questions from D")
 
-        # 每轮ei迭代训练完已经load model到vllm
-        _load_weights_from_state_dict(vllm, cpu_state_dict, train_config.rollout_device)
+        # 每轮ei迭代训练完已load model到vllm
 
         # Sample G outputs per question, compute rewards, filter to correct pairs
         correct_prompts, correct_outputs, correct_answers = ei_collect_correct_samples(
@@ -631,7 +535,7 @@ def train_ei_model(
             continue
         
         # print 采样的数据样例
-        logging.info(f"[EI train] step_{ei_step}: collect {len(correct_prompts)} correct sample output data")
+        logging.info(f"[EI train] step_{ei_step+1}: collect {len(correct_prompts)} correct sample output data")
         logging.info(f"[EI train] example correct sample data:"
                     f"correct_prompts: {correct_prompts[0]}"
                     f"correct_outputs: {correct_outputs[0]}"
@@ -641,24 +545,20 @@ def train_ei_model(
             model = model,
             tokenizer = tokenizer,
             optimizer = optimizer,
-            # vllm = vllm,
+            vllm = vllm,
             train_config = train_config,
+            eval_config = eval_config,
             train_prompts = correct_prompts,
             train_cot = correct_outputs,
             train_answers = correct_answers,  # not used in SFT
-            eval_cmd_q = eval_cmd_q,
-            eval_res_q = eval_res_q,
             global_sft_step = global_step,
             curr_ei_steps = ei_step,
         )
 
-        logging.info(f"[EI train] Step_{ei_step} | Correct samples: {len(correct_prompts)} | Globel sft step: {global_step} avg Loss: {loss:.4f}", color="green")
+        logging.info(f"[train EI] Step_{ei_step} | Correct samples: {len(correct_prompts)} | Globel sft step: {global_step} avg Loss: {loss:.4f}", color="green")
 
-        # load model params from cpu_state_dict to vllm(rollout) instance
-        cpu_state_dict = save_model_state_dict(model)
-        logging.info(f"[EI train] ei step_{ei_step+1} save model state dict to cpu_state_dict....")
         # 一次sft训练结束, eval_model= model, 后一次ei_step基于eval_model对抽样数据采集outputs
-        # load_model_into_vllm_instance(model, vllm, train_config.eval_device)
+        load_model_into_vllm_instance(model, vllm, train_config.eval_device)
     
     
     save_model_and_tokenizer(model, tokenizer, train_config,  f"ei_rollout_samples_{train_config.sample_questions_per_ei_step}")
@@ -690,9 +590,7 @@ def main(*,
 
     dotenv.load_dotenv()
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
     os.environ["HF_HOME"] = "~/autodl-tmp/hf"
-    os.environ["TRANSFORMERS_CACHE"] = "~/autodl-tmp/hf/models"
     os.environ["HF_HUB_CACHE"] = "~/autodl-tmp/hf/hub"
 
     train_config = TrainEIConfig()
@@ -742,15 +640,6 @@ def main(*,
 # 不变: sample_questions_per_ei_step=512,sft_train_epochs=64 => rollout=4, rollout = 2, rollout=8
 
 if __name__ == "__main__":
-    import multiprocessing as mp
-    import sys
-    try:
-        mp.set_start_method("spawn", force=True)
-    except RuntimeError:
-        # Start method may have been set elsewhere; ignore if already set
-        logging.error(f"multiprocessing set spawn except, will exit")
-        sys.exit(1)
-
     parser = ArgumentParser()
     parser.add_argument("--sample_questions_per_ei_step", type=int,
                     default=512, help="sample_questions_per_ei_step")

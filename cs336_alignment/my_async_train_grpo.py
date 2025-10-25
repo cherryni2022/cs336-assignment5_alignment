@@ -742,7 +742,6 @@ def main(
     dotenv.load_dotenv()
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["HF_HOME"] = "~/autodl-tmp/hf"
-    os.environ["TRANSFORMERS_CACHE"] = "~/autodl-tmp/hf/models"
     os.environ["HF_HUB_CACHE"] = "~/autodl-tmp/hf/hub"
 
     # Login Wandb
