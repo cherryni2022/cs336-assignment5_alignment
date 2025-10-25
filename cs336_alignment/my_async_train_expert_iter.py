@@ -2,6 +2,8 @@ import logging
 import math
 import os
 from contextlib import nullcontext
+import multiprocessing as mp
+import sys
 from dataclasses import asdict, dataclass
 from typing import Callable, List, Optional
 import dotenv
@@ -174,7 +176,7 @@ def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue,
                 "sft_train_batch_size": train_config.sft_train_batch_size,
                 "micro_batch_size": train_config.micro_batch_size,
                 "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
-            }
+            },
             tags=[train_config.experiment_name,
                    train_config.sample_questions_per_ei_step,
                    train_config.rollout_per_prompt,
@@ -707,8 +709,13 @@ def main(*,
                     "eval config": asdict(eval_config)})
     
     # 初始化vllm
-    vllm = init_vllm(model_id=local_model_path, device=train_config.eval_device, seed=seed)
-    logging.info(f"init_vllm with model_id: {local_model_path}, device: {train_config.eval_device}, seed: {seed}, gpu_memory_utilization: 0.9")
+    vllm = init_vllm(model_id=local_model_path, 
+                    device=train_config.eval_device, 
+                    seed=seed,
+                    gpu_memory_utilization=train_config.rollout_gpu_mem_util)
+    logging.info(f"rollout init_vllm with model_id: {local_model_path}, "
+                f"device: {train_config.eval_device}, seed: {seed},"
+                f"gpu_memory_utilization: {train_config.rollout_gpu_mem_util}")
     
     train_ei_model(
         train_config=train_config,
