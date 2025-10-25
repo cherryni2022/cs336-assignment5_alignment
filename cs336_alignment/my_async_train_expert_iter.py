@@ -124,6 +124,7 @@ class TrainEIConfig:
 class EvaluateConfig:
     data_path: str = os.path.join(PROJECT_DIR, "data/gsm8k/test.jsonl")
     prompt_path: str = os.path.join(PROJECT_DIR, "cs336_alignment/prompts/r1_zero.prompt")
+    eval_result_dir: str = os.path.join(PROJECT_DIR, "evaluations/ei")
     temperature: float = 1.0
     top_p: float = 1.0
     #stop_tokens: list[str] = field(default_factory=lambda: ["</answer>"])
@@ -451,7 +452,7 @@ def train_sft_model(
                 total_loss += avg_loss
 
                 logging.info(
-                    f"[trainSFT | ei step_{curr_ei_steps} sft_global step_{global_sft_step+1}]: "
+                    f"[trainSFT | ei step_{curr_ei_steps+1} sft_global step_{global_sft_step+1}]: "
                     f" | local sft step_{sft_step}"
                     f" | avg_loss: {avg_loss:.4f}"
                     f" | avg_response_entropy: {accumulated_token_entropy / train_config.gradient_accumulation_steps:.4f}"
@@ -475,7 +476,6 @@ def train_sft_model(
 
         global_sft_step += 1
 
-
         if (global_sft_step % train_config.eval_steps == 0):
             cpu_state_dict = save_model_state_dict(model)
             logging.info(f"[ei train] sft global step_{global_sft_step} save model state dict to cpu_state_dict....")
@@ -492,7 +492,6 @@ def train_sft_model(
             logging.info(f"[ei async eval] ei step_{curr_ei_steps} sft global step_{global_sft_step}: evaluate update_weights finished....")
 
             logging.info(f"[ei async eval] ei step_{curr_ei_steps} sft global step_{global_sft_step}: dispatch evaluation")
-            # TODO: off_policy训练 epochs_per_rollout_batch > 1, 一轮grpo_step中多次train_step=train_steps_per_rollout_batch
             eval_cmd_q.put({"type": "evaluate", "step": global_sft_step})
 
             
@@ -647,11 +646,11 @@ def train_ei_model(
             curr_ei_steps = ei_step,
         )
 
-        print_color(f"[EI train] Step_{ei_step} | Correct samples: {len(correct_prompts)} | Globel sft step: {global_step} Loss: {loss:.4f}", color="green")
+        logging.info(f"[EI train] Step_{ei_step} | Correct samples: {len(correct_prompts)} | Globel sft step: {global_step} avg Loss: {loss:.4f}", color="green")
 
         logging.info(f"Loaded weights to vllm at step_{ei_step}")
         # 一次sft训练结束, eval_model= model, 后一次ei_step基于eval_model对抽样数据采集outputs
-        load_model_into_vllm_instance(model, vllm)
+        load_model_into_vllm_instance(model, vllm, train_config.eval_device)
     
     
     save_model_and_tokenizer(model, tokenizer, train_config,  f"ei_rollout_samples_{train_config.sample_questions_per_ei_step}")
@@ -725,10 +724,20 @@ def main(*,
 # # [512, 1024, 2048]
 # train_config.rollout_per_prompt (每个问题的 rollout 数量 G)
 # train_config.sft_train_epochs (SFT train dataset epochs)
-# 不变: rollout:4, training_steps=8 => sample_questions_per_ei_step [512, 1024, 2048]
-# 不变: sample_questions_per_ei_step=512,train_steps=8 => rollout=4, rollout = 2, rollout=8
-# 不变: sample_questions_per_ei_step=512, rollout=4 => training_steps=8, train_steps=16
+# 不变: sample_questions_per_ei_step=512, rollout=4 => sft_train_epochs=16, sft_train_epochs=32
+# 不变: rollout:4, sft_train_epochs=64 => sample_questions_per_ei_step [512, 1024, 2048]
+# 不变: sample_questions_per_ei_step=512,sft_train_epochs=64 => rollout=4, rollout = 2, rollout=8
+
 if __name__ == "__main__":
+    import multiprocessing as mp
+    import sys
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        # Start method may have been set elsewhere; ignore if already set
+        logging.error(f"multiprocessing set spawn except, will exit")
+        sys.exit(1)
+
     parser = ArgumentParser()
     parser.add_argument("--sample_questions_per_ei_step", type=int,
                     default=512, help="sample_questions_per_ei_step")

@@ -802,11 +802,13 @@ def main(
 if __name__ == "__main__":
     # Ensure CUDA works with multiprocessing by using spawn instead of fork
     import multiprocessing as mp
+    import sys
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         # Start method may have been set elsewhere; ignore if already set
-        pass
+        logging.error(f"multiprocessing set spawn except, will exit")
+        sys.exit(1)
     
     parser = ArgumentParser()
     parser.add_argument("--sub_experiment_name", type=str, default="grpo_learning_rate", help="sub_experiment_name")
