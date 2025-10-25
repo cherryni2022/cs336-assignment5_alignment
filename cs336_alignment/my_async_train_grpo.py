@@ -3,6 +3,8 @@ import os
 from dataclasses import asdict, dataclass
 from contextlib import nullcontext
 from typing import Callable, List
+import multiprocessing as mp
+import sys
 from concurrent.futures import ThreadPoolExecutor, Future
 import dotenv
 import fire
@@ -427,7 +429,6 @@ def update_policy(
         )
     # 每次load train_batch_size 效率更高
     dataloader = DataLoader(dataset=dataset, 
-                #batch_size=train_config.train_batch_size, 
                 batch_size=train_config.micro_train_batch_size,
                 shuffle=True)
     cycled_dataloader = cycle_dataloader(dataloader)
@@ -801,8 +802,6 @@ def main(
 # 实验控制变量:
 if __name__ == "__main__":
     # Ensure CUDA works with multiprocessing by using spawn instead of fork
-    import multiprocessing as mp
-    import sys
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:

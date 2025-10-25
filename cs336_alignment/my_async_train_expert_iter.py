@@ -102,9 +102,10 @@ class TrainEIConfig:
     log_print_steps: int = 12
 
     eval_device: str = "cuda:1"
+    rollout_device: str = "cuda:1"
     eval_steps: int = 2
     rollout_gpu_mem_util: float = 0.45
-    eval_gpu_mem_util: float = 0.45
+    eval_gpu_mem_util: float = 0.40
     vllm_seed: int = 43
 
     # Learning Rate adjust
@@ -177,14 +178,7 @@ def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue,
                 "micro_batch_size": train_config.micro_batch_size,
                 "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
             },
-            tags=[train_config.experiment_name,
-                   train_config.sample_questions_per_ei_step,
-                   train_config.rollout_per_prompt,
-                   train_config.sft_train_epochs,
-                   train_config.sft_train_batch_size,
-                   train_config.micro_batch_size,
-                   train_config.gradient_accumulation_steps,
-            ]
+            tags=[train_config.experiment_name]
         )
         
         wandb.define_metric("eval_step")
@@ -307,16 +301,28 @@ class SFTDataset(Dataset):
         self.train_prompts = train_prompts
         self.train_cot = train_cot
         self.train_answers = train_answers
+        # Encode prompts and responses
+        encoded = tokenize_prompt_and_output(prompts, responses, tokenizer)
+        self.input_ids = encoded["input_ids"]
+        self.labels = encoded["labels"]
+        self.response_mask = encoded["response_mask"]
+        logging.info(f"[SFTDataset] init generate SFT Dataset Done, "
+                    f"input_ids.len={len(self.input_ids)},"
+                    f"labels.len={len(self.labels)},"
+                    f"response_mask.len={len(self.response_mask)},"
+        # self.input_ids = input_ids
+        # self.labels = labels
+        # self.response_mask = response_mask
 
     def __len__(self):
-        return len(self.train_prompts)
+        return len(self.input_ids)
 
-    def __getitem__(self, idx: int) -> tuple[str, str, float]:
-        prompt = self.train_prompts[idx]
-        cot = self.train_cot[idx]
-        answer = to_float(self.train_answers[idx])
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        input_ids = self.input_ids[idx]
+        labels = self.labels[idx]
+        response_mask = self.response_mask[idx]
 
-        return prompt, cot, answer
+        return input_ids, labels, response_mask
 
 # 用于每次专家迭代步骤中，收集所有 reward==1 的 (prompt, output) 对
 @torch.no_grad()
@@ -360,8 +366,6 @@ def train_sft_model(
     model,
     optimizer,
     tokenizer,
-    vllm,
-    async_evaluator,
     train_config: TrainEIConfig,
     train_prompts,
     train_cot,
@@ -381,7 +385,6 @@ def train_sft_model(
         shuffle=True,
         num_workers=4,
         pin_memory=True,
-        collate_fn=lambda batch: sft_collate_fn(batch, tokenizer),
     )
     sft_data_loader = cycle_dataloader(train_dataloader)
     logging.info(f"[trainSFT | ei step_{curr_ei_steps}] Dataloader initialized with batch size {train_config.sft_train_batch_size},"
@@ -534,7 +537,8 @@ def train_ei_model(
             "sft_train_batch_size": train_config.sft_train_batch_size,
             "micro_batch_size": train_config.micro_batch_size,
             "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
-        }
+        },
+        tags=[train_config.experiment_name]
     )
 
     wandb.define_metric("train_step")
@@ -611,7 +615,8 @@ def train_ei_model(
         print(f"[EI train] step_{ei_step}: Sample {len(batch_prompts)} questions from D")
 
         # 每轮ei迭代训练完已经load model到vllm
-        
+        _load_weights_from_state_dict(vllm, cpu_state_dict, train_config.rollout_device)
+
         # Sample G outputs per question, compute rewards, filter to correct pairs
         correct_prompts, correct_outputs, correct_answers = ei_collect_correct_samples(
             vllm_model=vllm,
@@ -636,8 +641,7 @@ def train_ei_model(
             model = model,
             tokenizer = tokenizer,
             optimizer = optimizer,
-            vllm = vllm,
-            async_evaluator = async_evaluator,
+            # vllm = vllm,
             train_config = train_config,
             train_prompts = correct_prompts,
             train_cot = correct_outputs,
@@ -650,9 +654,11 @@ def train_ei_model(
 
         logging.info(f"[EI train] Step_{ei_step} | Correct samples: {len(correct_prompts)} | Globel sft step: {global_step} avg Loss: {loss:.4f}", color="green")
 
-        logging.info(f"Loaded weights to vllm at step_{ei_step}")
+        # load model params from cpu_state_dict to vllm(rollout) instance
+        cpu_state_dict = save_model_state_dict(model)
+        logging.info(f"[EI train] ei step_{ei_step+1} save model state dict to cpu_state_dict....")
         # 一次sft训练结束, eval_model= model, 后一次ei_step基于eval_model对抽样数据采集outputs
-        load_model_into_vllm_instance(model, vllm, train_config.eval_device)
+        # load_model_into_vllm_instance(model, vllm, train_config.eval_device)
     
     
     save_model_and_tokenizer(model, tokenizer, train_config,  f"ei_rollout_samples_{train_config.sample_questions_per_ei_step}")
@@ -710,11 +716,11 @@ def main(*,
     
     # 初始化vllm
     vllm = init_vllm(model_id=local_model_path, 
-                    device=train_config.eval_device, 
+                    device=train_config.rollout_device, 
                     seed=seed,
                     gpu_memory_utilization=train_config.rollout_gpu_mem_util)
     logging.info(f"rollout init_vllm with model_id: {local_model_path}, "
-                f"device: {train_config.eval_device}, seed: {seed},"
+                f"device: {train_config.rollout_device}, seed: {seed},"
                 f"gpu_memory_utilization: {train_config.rollout_gpu_mem_util}")
     
     train_ei_model(
