@@ -103,8 +103,8 @@ class TrainEIConfig:
 
     eval_device: str = "cuda:1"
     rollout_device: str = "cuda:1"
-    eval_steps: int = 2
-    rollout_gpu_mem_util: float = 0.45
+    eval_steps: int = 8
+    rollout_gpu_mem_util: float = 0.85
     eval_gpu_mem_util: float = 0.40
     vllm_seed: int = 43
 
@@ -165,7 +165,7 @@ def eval_worker(cmd_q: mp.Queue, res_q: mp.Queue,
         lr = train_config.learning_rate
         wandb.init(
             entity=wandb_entity,
-            project="cs336-alignment-ei",
+            project="cs336-sft",
             group=group_name,
             job_type="eval",
             name=f"ei_d{train_config.sample_questions_per_ei_step}_g{train_config.rollout_per_prompt}_e{train_config.sft_train_epochs}_{lr}_{date_str}",
@@ -321,7 +321,7 @@ def train_sft_model(
         collate_fn=lambda batch: sft_collate_fn(batch, tokenizer),
     )
     sft_data_loader = cycle_dataloader(train_dataloader)
-    logging.info(f"[trainSFT] ei step_{curr_ei_steps+1}] Dataloader initialized with batch size {train_config.sft_train_batch_size},"
+    logging.info(f"[trainSFT] ei step_{curr_ei_steps+1} Dataloader initialized with batch size {train_config.sft_train_batch_size},"
           f" micro batch size: {train_config.micro_batch_size}")
     # step3:准备模型训练的optimazer等
     # ---------------------
@@ -455,7 +455,7 @@ def train_ei_model(
     group_name = f"{train_config.experiment_name}"
     wandb.init(
         entity=os.getenv("WANDB_ENTITY"),
-        project="cs336-alignment-ei",
+        project="cs336-sft",
         group=group_name,
         job_type="train",
         name=f"ei_d{train_config.sample_questions_per_ei_step}_g{train_config.rollout_per_prompt}_e{train_config.sft_train_epochs}_{lr}_{date_str}",
@@ -517,7 +517,7 @@ def train_ei_model(
         batch_prompts, batch_cots, batch_answers = next(iter(ei_train_dataloader))
         # batch_prompts = batch_samples[0]
         # batch_answers = batch_samples[2]
-        print(f"[EI train] step_{ei_step}: Sample {len(batch_prompts)} questions from D")
+        print(f"[EI train] step_{ei_step+1}: Sample {len(batch_prompts)} questions from D")
 
         # 每轮ei迭代训练完已load model到vllm
 
@@ -531,7 +531,7 @@ def train_ei_model(
         )
 
         if len(correct_prompts) == 0:
-            logging.info(f"[EI train] step_{ei_step}: no correct generations; skipping SFT update.")
+            logging.info(f"[EI train] step_{ei_step+1}: no correct generations; skipping SFT update.")
             continue
         
         # print 采样的数据样例
@@ -555,7 +555,7 @@ def train_ei_model(
             curr_ei_steps = ei_step,
         )
 
-        logging.info(f"[train EI] Step_{ei_step} | Correct samples: {len(correct_prompts)} | Globel sft step: {global_step} avg Loss: {loss:.4f}", color="green")
+        logging.info(f"[train EI] Step_{ei_step+1} | Correct samples: {len(correct_prompts)} | Globel sft step: {global_step} avg Loss: {loss:.4f}")
 
         # 一次sft训练结束, eval_model= model, 后一次ei_step基于eval_model对抽样数据采集outputs
         load_model_into_vllm_instance(model, vllm, train_config.eval_device)
